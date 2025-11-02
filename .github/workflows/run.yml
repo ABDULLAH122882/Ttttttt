@@ -28,5 +28,6 @@ jobs:
         env:
           WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
           WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
+          DISPLAY: :99
         run: |
-          python webook_bot.py
+          xvfb-run -a python webook_bot.py
