@@ -8,6 +8,10 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    env:
+      WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
+      WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
+
     steps:
       - name: تنزيل الملفات
         uses: actions/checkout@v4
