@@ -21,7 +21,7 @@ jobs:
       - name: تثبيت التبعيات اللازمة
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnss3 libxss1 libasound2 libgbm1 libgtk-3-0 xvfb
+          sudo apt-get install -y libnss3 libxss1 libasound2t64 libgbm1 libgtk-3-0 xvfb
 
       - name: تثبيت مكتبات Python
         run: |
