@@ -21,4 +21,4 @@ jobs:
         run: pip install requests selenium
 
       - name: تشغيل البوت
-        run: python "webook_bot (1).py"
+        run: python webook_bot.py
