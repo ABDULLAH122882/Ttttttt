@@ -1,0 +1,24 @@
+name: Run Webook Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # يشغله كل 6 ساعات
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: تنزيل الملفات
+        uses: actions/checkout@v3
+
+      - name: إعداد Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: تثبيت المتطلبات
+        run: pip install requests selenium
+
+      - name: تشغيل البوت
+        run: python "webook_bot (1).py"
