@@ -3,26 +3,25 @@ name: Run Webook Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # يشغله كل 6 ساعات
+    - cron: '0 */6 * * *'  # كل 6 ساعات
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
       - name: تنزيل الملفات
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: إعداد Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: تثبيت المتطلبات
-  run: |
-    pip install requests
-    pip install playwright
-    playwright install chromium
-    
+        run: |
+          python -m pip install -U pip
+          pip install requests playwright
+          python -m playwright install --with-deps chromium
 
       - name: تشغيل البوت
         run: python webook_bot.py
