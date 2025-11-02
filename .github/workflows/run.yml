@@ -1,7 +1,7 @@
 name: Run Webook Bot
 
 on:
-  workflow_dispatch: {}   # تشغيل يدوي فقط (لا يوجد cron)
+  workflow_dispatch: {}   # تشغيل يدوي فقط
 
 jobs:
   run-bot:
@@ -33,8 +33,17 @@ jobs:
         env:
           WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
           WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
-          START_DATE: "2025-11-03"   # غيّرها لو احتجت (YYYY-MM-DD)
+          START_DATE: "2025-11-03"
+          END_DATE: "2025-11-06"
+          TIME_RANGE: "00:00 - 16:00"
         run: |
           set -x
           mkdir -p artifacts
           xvfb-run -a python webook_bot.py | tee artifacts/bot.log
+
+      - name: رفع اللقطات والملفات التشخيصية
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: artifacts
