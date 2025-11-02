@@ -3,7 +3,7 @@ name: Run Webook Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # كل 6 ساعات (يمكن تعديلها)
+    - cron: '0 */6 * * *'  # يشغّل كل 6 ساعات (عدّلها لو حاب)
 
 jobs:
   run-bot:
@@ -18,16 +18,19 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: تثبيت المتطلبات
+      - name: تثبيت باكجات البايثون
         run: |
           pip install --upgrade pip
-          pip install playwright
-          python -m playwright install --with-deps chromium
+          pip install requests playwright
+
+      # هذه الخطوة هي السر: تجهّز كل تبعيات Playwright + المتصفحات + Xvfb
+      - name: إعداد Playwright (تبعيات + متصفحات + Xvfb)
+        uses: microsoft/playwright-github-action@v1
 
       - name: تشغيل البوت
         env:
           WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
           WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
-          DISPLAY: :99
         run: |
-          xvfb-run -a python webook_bot.py
+          python -m playwright install chromium
+          python webook_bot.py
