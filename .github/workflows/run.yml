@@ -1,218 +1,43 @@
-# webook_bot.py
-# -*- coding: utf-8 -*-
+name: Run Webook Bot
 
-import os
-import re
-import asyncio
-from datetime import datetime, timedelta
+on:
+  workflow_dispatch: {}   # تشغيل يدوي فقط (بدون تشغيل تلقائي)
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
 
-# ====== إعدادات عامة ======
-DEFAULT_TIMEOUT_MS = 60_000  # 60s
-SCREENSHOT_DIR = "artifacts"  # نفس المجلد الذي يُرفع كأرتيفاكت
+    steps:
+      - name: تنزيل الملفات
+        uses: actions/checkout@v4
 
-# خريطة أسماء الأشهر بالعربية
-AR_MONTH = {
-    1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل", 5: "مايو", 6: "يونيو",
-    7: "يوليو", 8: "أغسطس", 9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
-}
+      - name: إعداد Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-def env(name: str, default: str | None = None, required: bool = False) -> str | None:
-    v = os.getenv(name, default)
-    if required and not v:
-        raise RuntimeError(f"Missing required env: {name}")
-    return v
+      - name: تثبيت التبعيات اللازمة للنظام
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+              libcups2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+              libasound2t64 libxshmfence1 libgbm1 fonts-liberation
 
-def parse_date(s: str) -> datetime:
-    return datetime.fromisoformat(s)
+      - name: تثبيت مكتبات Python
+        run: |
+          pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
-def build_date_pattern(d: datetime):
-    """يطابق الزر سواء بالعربي (03 نوفمبر) أو بالإنجليزي (03 NOV)."""
-    en = d.strftime("%d %b").upper()                   # 03 NOV
-    ar = f'{d.strftime("%d")} {AR_MONTH[d.month]}'     # 03 نوفمبر
-    # بعض الواجهات تضع أصفار غير مهمة أو مسافات مختلفة، لذلك نسمح بتنوع بسيط
-    return re.compile(rf"\b({re.escape(en)}|{re.escape(ar)})\b", re.IGNORECASE)
-
-def build_time_pattern(timestr: str):
-    """يطابق بالضبط نص فترة الوقت كما يظهر في الزر (مثال: 00:00 - 16:00)."""
-    return re.compile(rf"^{re.escape(timestr.strip())}$")
-
-async def safe_click_button_by_name(page, pattern, *, timeout=DEFAULT_TIMEOUT_MS):
-    btn = page.get_by_role("button", name=pattern).first
-    await btn.scroll_into_view_if_needed()
-    await btn.wait_for(state="visible", timeout=timeout)
-    await btn.click(timeout=timeout)
-
-async def maybe_click_one_of(page, names, *, timeout=DEFAULT_TIMEOUT_MS):
-    """يجرب مجموعة أسماء أزرار (عربي/إنجليزي) ويضغط أول ما يعثر عليه."""
-    for n in names:
-        try:
-            await safe_click_button_by_name(page, re.compile(rf"^{re.escape(n)}$", re.IGNORECASE), timeout=timeout)
-            print(f"[info] Clicked button: {n}")
-            return True
-        except Exception:
-            continue
-    return False
-
-async def ensure_logged_in(page, email: str | None, password: str | None):
-    """محاولة تسجيل الدخول إن وُجد زر/رابط للدخول. تتخطى بهدوء إن لم يلزم."""
-    try:
-        # أزرار/روابط شائعة للدخول
-        candidates = [r"تسجيل الدخول", r"تسجيل الدخول/إنشاء حساب", r"الدخول", r"Log in", r"Sign in"]
-        found = False
-        for label in candidates:
-            try:
-                await safe_click_button_by_name(page, re.compile(label, re.IGNORECASE), timeout=5_000)
-                found = True
-                break
-            except Exception:
-                # ربما الرابط نصّي وليس "role=button"
-                try:
-                    await page.get_by_text(re.compile(label, re.IGNORECASE)).first.click(timeout=2_000)
-                    found = True
-                    break
-                except Exception:
-                    pass
-
-        if not found:
-            print("[login] No explicit login button detected; continuing.")
-            return
-
-        if not (email and password):
-            print("[login] Login UI found but no credentials provided. Skipping login.")
-            return
-
-        # حقول البريد/كلمة السر الشائعة
-        # نجرب by placeholder/name/type/label
-        email_locators = [
-            page.get_by_placeholder(re.compile("email|البريد", re.IGNORECASE)).first,
-            page.locator('input[type="email"]').first,
-            page.get_by_label(re.compile("email|البريد", re.IGNORECASE)).first,
-        ]
-        pw_locators = [
-            page.get_by_placeholder(re.compile("password|كلمة المرور", re.IGNORECASE)).first,
-            page.locator('input[type="password"]').first,
-            page.get_by_label(re.compile("password|كلمة المرور", re.IGNORECASE)).first,
-        ]
-
-        # املأ البريد
-        for loc in email_locators:
-            try:
-                await loc.fill(email, timeout=5_000)
-                break
-            except Exception:
-                continue
-
-        # املأ كلمة المرور
-        for loc in pw_locators:
-            try:
-                await loc.fill(password, timeout=5_000)
-                break
-            except Exception:
-                continue
-
-        # زر دخول
-        await maybe_click_one_of(page, ["تسجيل الدخول", "دخول", "Log in", "Sign in"], timeout=10_000)
-        await page.wait_for_load_state("networkidle", timeout=15_000)
-        print("[login] Attempted login flow (if required).")
-    except Exception as e:
-        print(f"[login] Skipped/failed gracefully: {e}")
-
-async def select_date_and_time(page, day: datetime, time_range: str):
-    """اختيار التاريخ ثم الفترة الزمنية."""
-    # التاريخ
-    date_pat = build_date_pattern(day)
-    await safe_click_button_by_name(page, date_pat, timeout=DEFAULT_TIMEOUT_MS)
-
-    # الوقت
-    time_pat = build_time_pattern(time_range)
-    await safe_click_button_by_name(page, time_pat, timeout=DEFAULT_TIMEOUT_MS)
-
-async def main():
-    # ====== قراءة المتغيرات ======
-    EVENT_URL = env("EVENT_URL", required=True)
-    START_DATE = parse_date(env("START_DATE", required=True))
-    END_DATE = parse_date(env("END_DATE", required=True))
-    TIME_RANGE = env("TIME_RANGE", "00:00 - 16:00")
-
-    WEBOOK_EMAIL = env("WEBOOK_EMAIL")
-    WEBOOK_PASSWORD = env("WEBOOK_PASSWORD")
-
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(locale="ar", viewport={"width": 1280, "height": 800})
-        page = await context.new_page()
-        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
-
-        print(f"[start] Navigating to: {EVENT_URL}")
-        await page.goto(EVENT_URL, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except PWTimeout:
-            pass
-
-        # قبول الكوكيز إن ظهر
-        await maybe_click_one_of(page, ["موافق", "حسناً", "قبول", "Accept", "Got it"], timeout=5_000)
-
-        # تسجيل الدخول (اختياري)
-        await ensure_logged_in(page, WEBOOK_EMAIL, WEBOOK_PASSWORD)
-
-        # أحيانًا يحتاج الموقع إلى تمرير بسيط لإظهار الأزرار
-        await page.mouse.wheel(0, 600)
-
-        # ====== الحجز لمدى الأيام ======
-        current = START_DATE
-        while current <= END_DATE:
-            label = current.strftime("%d %b").upper()
-            print(f"--- Booking {label} ---")
-            try:
-                await select_date_and_time(page, current, TIME_RANGE)
-
-                # بعد اختيار الوقت، نحاول متابعة/التالي/إضافة للسلة
-                proceeded = await maybe_click_one_of(
-                    page,
-                    ["التالي", "متابعة", "متابعة الدفع", "تابع", "Continue", "Next", "Proceed", "Add to cart", "إضافة إلى السلة"],
-                    timeout=15_000,
-                )
-
-                # لقطة شاشة لكل يوم
-                shot_name = f"{SCREENSHOT_DIR}/selected_{current.strftime('%Y-%m-%d')}.png"
-                await page.screenshot(path=shot_name, full_page=True)
-                print(f"[ok] Selected {current.date()} | time '{TIME_RANGE}' | proceeded={proceeded} | screenshot={shot_name}")
-
-            except Exception as e:
-                print(f"⚠️ Failed {label}: {e}")
-                # لقطة عند الفشل
-                fail_shot = f"{SCREENSHOT_DIR}/failed_{current.strftime('%Y-%m-%d')}.png"
-                try:
-                    await page.screenshot(path=fail_shot, full_page=True)
-                    print(f"[shot] Saved failure screenshot: {fail_shot}")
-                except Exception:
-                    pass
-
-            # لفترات فيها تحميلات كثيفة
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except PWTimeout:
-                pass
-
-            current += timedelta(days=1)
-
-        # حفظ لوج HTML أخيرًا (اختياري)
-        try:
-            html_path = f"{SCREENSHOT_DIR}/final_page.html"
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            print(f"[dump] Saved final HTML: {html_path}")
-        except Exception:
-            pass
-
-        await context.close()
-        await browser.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
- 
+      - name: تشغيل البوت (يدويًا)
+        env:
+          WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
+          WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
+          START_DATE: "2025-11-03"
+          END_DATE: "2025-11-06"
+          TIME_RANGE: "00:00 - 16:00"
+          EVENT_URL: "https://webook.com/ar/..."   # ضع هنا رابط الحدث
+        run: |
+          set -x
+          mkdir -p artifacts
+          xvfb-run -a python webook_bot.py | tee artifacts/bot.log
