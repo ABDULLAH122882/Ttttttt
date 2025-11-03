@@ -1,5 +1,5 @@
 # webook_bot.py
-# يسجّل فيديو للجلسة في artifacts/videos/ + حلول 404 + اختيار تاريخ عربي/إنجليزي
+# يسجّل فيديو للجلسة في artifacts/videos/ + يتجاوز 404 + يدعم تواريخ عربية/إنجليزية
 
 import os, re, sys, time, random
 from datetime import datetime, timedelta, date
@@ -9,11 +9,11 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ====== متغيرات البيئة ======
 EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
 PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
-EVENT_URL = os.getenv("EVENT_URL", "").strip()  # ضع رابط صفحة الحجز نفسه
-START_DATE = os.getenv("START_DATE", "").strip()  # مثال: 2025-11-03
-END_DATE   = os.getenv("END_DATE", "").strip()    # مثال: 2025-11-06
+EVENT_URL = os.getenv("EVENT_URL", "").strip()     # ضع رابط صفحة الحجز نفسه
+START_DATE = os.getenv("START_DATE", "").strip()   # مثال: 2025-11-03
+END_DATE   = os.getenv("END_DATE", "").strip()     # مثال: 2025-11-06
 TIME_RANGE = os.getenv("TIME_RANGE", "00:00 - 16:00").strip()
-PROXY_URL  = os.getenv("PROXY_URL", "").strip()   # اختياري
+PROXY_URL  = os.getenv("PROXY_URL", "").strip()    # اختياري
 
 if not EVENT_URL:
     print("❌ ERROR: EVENT_URL غير مهيأ.")
@@ -40,13 +40,13 @@ def month_ar(m: int) -> str:
     return {1:"يناير",2:"فبراير",3:"مارس",4:"أبريل",5:"مايو",6:"يونيو",7:"يوليو",8:"أغسطس",9:"سبتمبر",10:"أكتوبر",11:"نوفمبر",12:"ديسمبر"}[m]
 
 def day_variants(d: date):
-    day2 = f"{d.day:02d}"           # 03
-    day1 = str(d.day)               # 3
-    day_ar2 = day2.translate(AR_DIGITS)  # ٠٣
-    day_ar1 = day1.translate(AR_DIGITS)  # ٣
-    en_s = MONTHS_EN_SHORT[d.month-1]    # Nov
-    en_l = MONTHS_EN_LONG[d.month-1]     # November
-    ar_l = month_ar(d.month)             # نوفمبر
+    day2 = f"{d.day:02d}"                 # 03
+    day1 = str(d.day)                     # 3
+    day_ar2 = day2.translate(AR_DIGITS)   # ٠٣
+    day_ar1 = day1.translate(AR_DIGITS)   # ٣
+    en_s = MONTHS_EN_SHORT[d.month-1]     # Nov
+    en_l = MONTHS_EN_LONG[d.month-1]      # November
+    ar_l = month_ar(d.month)              # نوفمبر
     iso  = d.strftime("%Y-%m-%d")
     return list({  # unique
         f"{day2} {en_s}", f"{day1} {en_s}", f"{day2} {en_s.upper()}",
@@ -148,7 +148,7 @@ def run_bot():
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/127.0.0.0 Safari/537.36")
 
-        # ✅ تسجيل الفيديو مباشرة داخل artifacts/videos/ (حتى لا نحتاج نقل)
+        # ✅ تسجيل الفيديو مباشرة داخل artifacts/videos/
         context = browser.new_context(
             user_agent=ua,
             viewport={"width": 1366, "height": 768},
@@ -156,19 +156,14 @@ def run_bot():
             timezone_id="Asia/Riyadh",
             geolocation={"latitude": 24.7136, "longitude": 46.6753},
             permissions=["geolocation"],
-            record_video_dir="artifacts/videos",                  # <— فيديو هنا
-            record_video_size={"width": 1366, "height": 768},     # دقة الفيديو
+            record_video_dir="artifacts/videos",
+            record_video_size={"width": 1366, "height": 768},
         )
 
-        # تتبّع HTTP للتشخيص
-        def on_response(r):
-            try:
-                print(f"[HTTP] {r.status()} {r.url}")
-            except:
-                pass
-
         page = context.new_page()
-        page.on("response", on_response)
+
+        # تتبّع HTTP للتشخيص
+        page.on("response", lambda r: print(f"[HTTP] {r.status()} {r.url}"))
 
         try:
             # ابدأ من الهوم لتوليد الجلسة
@@ -230,14 +225,22 @@ def run_bot():
                 print(f"ℹ️ لم أستطع حفظ الصورة: {e}")
 
         finally:
-            # مهم جدًا: إغلاق الصفحة ثم الـ context ليتم حفظ الفيديو داخل artifacts/videos/
+            # مهم: للحصول على مسار الفيديو يجب إغلاق الصفحة أولاً
+            video_path = None
             try:
                 page.close()
-            except Exception:
-                pass
+                # بعد إغلاق الصفحة يصبح الفيديو جاهزًا للمسار
+                if page.video:
+                    video_path = page.video.path()
+            except Exception as e:
+                print(f"ℹ️ video path err: {e}")
+
             context.close()
             browser.close()
-            print("🎥 تم حفظ فيديو الجلسة في artifacts/videos/ (ملف .webm)")
+            if video_path:
+                print(f"🎥 تم حفظ فيديو الجلسة هنا: {video_path}")
+            else:
+                print("ℹ️ لم يُعثر على مسار الفيديو (تحقق من record_video_dir و إغلاق الصفحة قبل context).")
 
 if __name__ == "__main__":
     try:
