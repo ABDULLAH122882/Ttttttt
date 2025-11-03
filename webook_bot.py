@@ -1,287 +1,417 @@
 # -*- coding: utf-8 -*-
-import os, random, time, sys, re
-from datetime import datetime
-from typing import List
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import os, re, time, random, sys
+from datetime import datetime, timedelta, date
+from typing import Optional
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Error as PWError
 
-# ========= إعدادات عامّة =========
-ART_DIR = "artifacts"
-os.makedirs(ART_DIR, exist_ok=True)
+# ================= إعدادات من البيئة =================
+TIMEOUT_MS     = int(os.getenv("TIMEOUT_MS", "120000"))  # مهلة عامة طويلة
+HOLD_SECONDS   = float(os.getenv("HOLD_SECONDS", "6"))   # انتظار قبل الإغلاق
+HEADLESS       = os.getenv("HEADLESS", "1") != "0"
 
-EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
-PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
-START_DATE = os.getenv("START_DATE", "").strip()   # YYYY-MM-DD (اختياري)
-END_DATE   = os.getenv("END_DATE", "").strip()     # YYYY-MM-DD (اختياري)
-TIME_RANGE = os.getenv("TIME_RANGE", "00:00 - 16:00").strip()  # اختياري، نختار 16:00
-HOME_URL   = "https://webook.com/ar"
-SEARCH_QUERY = "حديقة السويدي"     # ما نبحث عنه
-HEADLESS = True                     # اتركه True داخل GitHub Actions
+EMAIL          = os.getenv("WEBOOK_EMAIL", "").strip()
+PASSWORD       = os.getenv("WEBOOK_PASSWORD", "").strip()
+START_DATE     = os.getenv("START_DATE", "").strip()     # اختياري YYYY-MM-DD
+END_DATE       = os.getenv("END_DATE", "").strip()       # اختياري YYYY-MM-DD
+SEARCH_QUERY   = os.getenv("SEARCH_QUERY", "حديقة السويدي").strip()
 
-# ========= أدوات مساعدة =========
-def log(msg: str):
-    print(msg, flush=True)
+HOME_URL       = "https://webook.com/"
+ART_DIR        = "artifacts"
 
-def snooze(a=0.4, b=1.2):
-    time.sleep(random.uniform(a, b))
+# ================= أدوات مساعدة عامة =================
+def log(msg: str): print(msg, flush=True)
+def snooze(a=0.35, b=0.95): time.sleep(random.uniform(a, b))
 
-def wait_idle(page):
-    # انتظار بسيط ليبدو طبيعي
-    page.wait_for_timeout(500)
-    snooze(0.4, 1.0)
+def wait_idle(page, extra_sleep=(0.4, 1.0)):
+    try: page.wait_for_load_state("domcontentloaded", timeout=TIMEOUT_MS)
+    except: pass
+    try: page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+    except: pass
+    snooze(*extra_sleep)
+
+def wait_for_visible(scope, selector: str, timeout: Optional[int] = None):
+    timeout = timeout or TIMEOUT_MS
+    loc = scope.locator(selector).first
+    loc.wait_for(state="visible", timeout=timeout)
+    return loc
+
+def click_with_retry(scope, selector: str, retries=3, name="element"):
+    last_err = None
+    for i in range(1, retries+1):
+        try:
+            loc = wait_for_visible(scope, selector)
+            try: loc.scroll_into_view_if_needed(timeout=min(5000, TIMEOUT_MS))
+            except: pass
+            loc.click(timeout=TIMEOUT_MS)
+            log(f"🖱️ CLICK {name} (try {i})")
+            wait_idle(loc.page)
+            return True
+        except Exception as e:
+            last_err = e
+            log(f"⏳ waiting {name} (try {i})… {e}")
+            snooze(0.5, 1.2)
+    log(f"❌ FAILED CLICK {name}: {last_err}")
+    return False
+
+def fill_with_retry(scope, selector: str, text: str, retries=3, name="input"):
+    last_err = None
+    for i in range(1, retries+1):
+        try:
+            loc = wait_for_visible(scope, selector)
+            try: loc.scroll_into_view_if_needed(timeout=min(5000, TIMEOUT_MS))
+            except: pass
+            loc.click(timeout=TIMEOUT_MS)
+            loc.fill("")
+            for ch in text: loc.type(ch, delay=random.randint(15, 45))
+            log(f"⌨️ FILL {name} (try {i})")
+            return True
+        except Exception as e:
+            last_err = e
+            log(f"⏳ waiting {name} (try {i})… {e}")
+            snooze(0.5, 1.2)
+    log(f"❌ FAILED FILL {name}: {last_err}")
+    return False
 
 def looks_like_404(page) -> bool:
     try:
-        # عنوان فيه 404 أو وجود نص 404 في الصفحة
         t = (page.title() or "").lower()
-        if "404" in t: 
+        if "404" in t: return True
+        if page.locator("text=404").first.count() and page.locator("text=404").first.is_visible():
             return True
-        if page.locator("text=404").first.is_visible():
-            return True
-    except Exception:
-        pass
+    except: pass
     return False
 
 def reload_if_404(page, attempts=3):
     for i in range(attempts):
-        if not looks_like_404(page):
-            return
-        log(f"⚠️ صفحة 404 مكتشفة — إعادة تحميل ({i+1}/{attempts})")
-        page.reload(wait_until="domcontentloaded")
+        if not looks_like_404(page): return
+        log(f"⚠️ 404 detected → reload ({i+1}/{attempts})")
+        page.reload(wait_until="domcontentloaded", timeout=TIMEOUT_MS)
         wait_idle(page)
 
-def click_if_visible(page, locator_query: str, label_desc: str):
-    loc = page.locator(locator_query)
-    if loc.count() and loc.first.is_visible():
-        loc.first.click()
-        log(f"✅ تم الضغط على {label_desc}")
-        wait_idle(page)
-        return True
-    return False
+def parse_iso(s):
+    try: return datetime.strptime(s, "%Y-%m-%d").date()
+    except: return None
 
-def human_type(el, text: str):
-    # كتابة بشرية خفيفة
-    for ch in text:
-        el.type(ch, delay=random.randint(20, 70))
-    snooze(0.2, 0.4)
-
-# ========= الإجراءات الأساسية =========
-def dismiss_cookies(page):
-    # أزرار رفض/قبول شائعة
-    candidates = [
-        "button:has-text('رفض')",
-        "button:has-text('رفض الكل')",
-        "button:has-text('قبول')",
-        "button:has-text('أوافق')",
-        "[aria-label*='Cookies'] >> text=رفض",
+# ================= التعامل مع الكوكيز =================
+def handle_cookies(page):
+    reject = [
+        "button:has-text('رفض')","button:has-text('رفض الكل')",
+        "button:has-text('Decline')","button:has-text('Reject')","button:has-text('Reject All')",
+        "[aria-label*='Reject']",
     ]
-    for q in candidates:
-        try:
-            if page.locator(q).count():
-                page.locator(q).first.click()
-                log("🍪 تم التعامل مع نافذة الكوكيز")
-                wait_idle(page)
-                return
-        except Exception:
-            pass
+    accept = [
+        "button:has-text('قبول')","button:has-text('أوافق')",
+        "button:has-text('Accept')","button:has-text('Agree')","[aria-label*='Accept']",
+    ]
+    for sel in reject:
+        if click_with_retry(page, sel, name="Reject Cookies"): 
+            log("✅ Cookies: Rejected"); return
+    for sel in accept:
+        if click_with_retry(page, sel, name="Accept Cookies"):
+            log("ℹ️ Cookies: Accepted"); return
+    log("ℹ️ Cookies banner not found.")
 
-def go_home(page):
-    page.goto(HOME_URL, wait_until="domcontentloaded")
+# ================= دخول الصفحة الرئيسية والبحث =================
+def open_home(page):
+    log("🏠 OPEN HOME")
+    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
     reload_if_404(page)
     wait_idle(page)
-    dismiss_cookies(page)
+    handle_cookies(page)
 
-def search_event(page, query: str):
-    log("🔎 البحث عن الفعالية...")
-    # حقول البحث المحتملة
-    fields = page.locator("input[placeholder*='ابحث'], input[type='search'], input[role='searchbox'], input[placeholder*='Search']")
-    if not fields.count():
-        # بعض المواقع تظهر العدسة أولاً
-        click_if_visible(page, "button:has([data-icon='search']), button:has-text('بحث')", "زر البحث")
-        fields = page.locator("input[placeholder*='ابحث'], input[type='search'], input[role='searchbox'], input[placeholder*='Search']")
-    if fields.count():
-        fld = fields.first
-        fld.click()
-        fld.clear()
-        human_type(fld, query)
-        fld.press("Enter")
-        wait_idle(page)
-    else:
-        log("⚠️ لم أجد مربع البحث — سأحاول مباشرة عبر روابط النتائج")
-
-    # فتح بطاقة الفعالية
-    result_texts = [
-        "حديقة السويدي", "السويدي بارك", "Suwaidi Park", "Swede Park", "حديقة السويدي 2025"
-    ]
-    for t in result_texts:
-        if click_if_visible(page, f"a:has-text('{t}'), div:has-text('{t}') >> a", f"رابط '{t}'"):
-            return True
-    # بديل: أول بطاقة في النتائج
-    if click_if_visible(page, "a[href*='suwaidi']", "بطاقة السويدي (تخمين)"):
-        return True
-    log("❌ لم أتمكن من فتح صفحة الفعالية من نتائج البحث.")
-    return False
-
-def open_booking(page):
-    log("🎫 فتح صفحة الحجز...")
-    # أزرار الحجز المحتملة
-    labels = ["احجز التذاكر", "احجز الآن", "حجز التذاكر", "Book tickets", "Book now", "Buy tickets"]
-    for txt in labels:
-        if click_if_visible(page, f"button:has-text('{txt}'), a:has-text('{txt}')", txt):
-            return True
-    log("⚠️ لم أجد زر الحجز — سأحاول الضغط على أول زر يشبه الحجز")
-    return click_if_visible(page, "a[href*='book'], button[href*='book']", "زر حجز تخميني")
-
-def pick_time_slot(page):
-    preferred = ["16:00", "16.00"]
-    log("⏰ محاولة اختيار وقت الحجز...")
-    for t in preferred:
-        if click_if_visible(page, f"button:has-text('{t}')", f"الوقت {t}"):
-            return True
-        # أحيانًا كـ span داخل button
-        loc = page.locator(f"text='{t}'")
-        if loc.count() and loc.first.is_visible():
-            loc.first.click()
-            log(f"✅ تم اختيار الوقت {t}")
-            wait_idle(page)
-            return True
-    # بديل: أي خيار ضمن النطاق
-    any16 = page.locator("button:has-text('16')")  # احتياط
-    if any16.count():
-        any16.first.click()
-        log("✅ تم اختيار وقت ضمن نطاق 16")
-        wait_idle(page)
-        return True
-    log("⚠️ لم أجد خانة الوقت 16:00")
-    return False
-
-def ensure_login_if_needed(page):
-    # إذا ظهرت صفحة تسجيل الدخول، املأها
-    if page.locator("input[name*='email'], input[type='email']").count() and page.locator("input[type='password'], input[name*='pass']").count():
-        log("🔐 صفحة تسجيل الدخول مكتشفة")
-        if not EMAIL or not PASSWORD:
-            log("❌ لا توجد بيانات WEBOOK_EMAIL/WEBOOK_PASSWORD في الأسرار.")
-            return False
+def search_event(page, query="حديقة السويدي"):
+    log(f"🔎 SEARCH: {query}")
+    # قد تكون أيقونة بحث
+    for sel in [
+        "button[aria-label*='بحث']","button[aria-label*='search']",
+        "button:has(svg)","button:has-text('بحث')","[data-testid*='search']"
+    ]:
         try:
-            email_field = page.locator("input[name*='email'], input[type='email']").first
-            pass_field  = page.locator("input[type='password'], input[name*='pass']").first
-            email_field.click()
-            human_type(email_field, EMAIL)
-            snooze(0.2, 0.5)
-            pass_field.click()
-            human_type(pass_field, PASSWORD)
-            log("✅ تم إدخال البريد وكلمة المرور")
-            snooze(0.5, 1.0)
+            if page.locator(sel).first.count() and page.locator(sel).first.is_visible():
+                page.locator(sel).first.click()
+                wait_idle(page)
+                break
+        except: pass
 
-            # أزرار "تسجيل الدخول"
-            for btn_txt in ["تسجيل الدخول", "Log in", "Sign in", "دخول"]:
-                if click_if_visible(page, f"button:has-text('{btn_txt}'), input[type='submit'][value*='{btn_txt}']", "زر تسجيل الدخول"):
-                    break
+    # حقول البحث
+    inputs = [
+        "input[type='search']","input[placeholder*='بحث']","input[placeholder*='Search']",
+        "input[name='q']","input[aria-label*='بحث']","input[aria-label*='search']",
+    ]
+    for sel in inputs:
+        if fill_with_retry(page, sel, query, name="search box"):
+            page.keyboard.press("Enter")
+            wait_idle(page, (1.0, 2.0))
+            break
+    else:
+        log("❌ search box not found"); 
+        return False
 
-            # انتظر انتقال أو ظهور عناصر ما بعد الدخول
-            page.wait_for_timeout(1500)
+    # افتح نتيجة تحتوي السويدي/حديقة
+    result_sels = [
+        "a[href*='suwaidi-park']",
+        "a:has-text('حديقة')",
+        "a:has-text('Suwaidi')",
+        "[role=link]:has-text('حديقة')",
+    ]
+    for sel in result_sels:
+        if click_with_retry(page, sel, name="result card/link"):
             wait_idle(page)
-        except Exception as e:
-            log(f"⚠️ خطأ أثناء إدخال بيانات الدخول: {e}")
+            return True
+
+    # بديل: أول بطاقة/رابط يحتوي كلمة
+    try:
+        any_res = page.locator("a, [role=link], article, div.card").filter(
+            has_text=re.compile(r"حديقة|Suwaidi", re.I)
+        ).first
+        if any_res.count() and any_res.is_visible():
+            any_res.click()
+            wait_idle(page)
+            return True
+    except: pass
+
+    log("❌ no result link opened")
+    return False
+
+# ================= الذهاب لصفحة الحجز =================
+def open_booking(page):
+    # إن وصلنا لصفحة منطقة بدون /book أضفها
+    if "/zones/" in page.url and "/book" not in page.url:
+        try:
+            page.goto(page.url.rstrip("/") + "/book", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+            wait_idle(page)
+        except: pass
+
+    if "/zones/" in page.url and "/book" in page.url: 
+        log("🎫 already at /book"); 
+        return True
+
+    # أزرار الحجز
+    ctas = [
+        "a:has-text('Book tickets')","button:has-text('Book tickets')",
+        "a:has-text('Book now')","button:has-text('Book now')",
+        "a:has-text('Booking now')","button:has-text('Booking now')",
+        "a:has-text('احجز')","button:has-text('احجز')",
+        "a:has-text('احجز الآن')","button:has-text('احجز الآن')",
+        "a:has-text('حجز التذاكر')","button:has-text('حجز التذاكر')",
+        "a[href*='/book']","[role=link][href*='/book']",
+    ]
+    for sel in ctas:
+        if click_with_retry(page, sel, name="CTA Book"):
+            try: page.wait_for_url(re.compile(r"/zones/.+/book"), timeout=TIMEOUT_MS)
+            except: pass
+            wait_idle(page)
+            break
+
+    # لو لا زلنا لسنا في /book أضفها يدويًا
+    if "/zones/" in page.url and "/book" not in page.url:
+        try:
+            page.goto(page.url.rstrip("/") + "/book", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+            wait_idle(page)
+        except: pass
+
+    ok = ("/zones/" in page.url and "/book" in page.url)
+    log("🎫 /book reached" if ok else "⚠️ failed to reach /book")
+    return ok
+
+# ================= تسجيل الدخول إن طُلب =================
+def ensure_login_if_needed(page) -> bool:
+    # هل تظهر حقول دخول؟
+    has_login = (
+        page.locator("input[type='password']").first.count() or
+        page.locator("input[name*='password']").first.count()
+    )
+    if ("login" in page.url.lower()) or has_login:
+        if not EMAIL or not PASSWORD:
+            log("❌ WEBOOK_EMAIL/WEBOOK_PASSWORD missing."); 
             return False
+
+        # البريد
+        if not fill_with_retry(page,
+            "input[type='email'], input[name='email'], input[name*='email'], input[id*='email'], input[placeholder*='البريد']",
+            EMAIL, name="email"):
+            return False
+        snooze(0.2, 0.5)
+
+        # كلمة المرور
+        if not fill_with_retry(page,
+            "input[type='password'], input[name='password'], input[name*='pass'], input[id*='password'], input[placeholder*='كلمة']",
+            PASSWORD, name="password"):
+            return False
+        snooze(0.3, 0.7)
+
+        # زر الدخول
+        if not click_with_retry(page,
+            "button:has-text('تسجيل الدخول'), button:has-text('Log in'), button:has-text('Login'), input[type='submit']",
+            name="login button"):
+            # جرّب Enter
+            try:
+                page.locator("input[type='password']").first.press("Enter")
+            except: pass
+        # انتظر اختفاء حقول الدخول/تغير العنوان
+        for _ in range(15):
+            if page.locator("input[type='password']").count()==0 and "login" not in page.url.lower():
+                log("🔐 logged in.")
+                wait_idle(page)
+                return True
+            snooze(0.4, 0.8)
+        log("ℹ️ login form still visible (maybe OTP).")
+        return True
     return True
 
+# ================= اختيار وقت 16:00 =================
+def choose_time_slot(page):
+    log("⏰ choose time 16:00…")
+    candidates = ["16:00", "16.00", "04:00 PM", "00:00 - 16:00", "00:00–16:00", "00:00 – 16:00"]
+    # افتح لائحة الأوقات إن وجدت
+    for opener in ["اختر الوقت","Select time","Choose time","اختَر الوقت"]:
+        try:
+            if page.get_by_text(opener, exact=False).first.count():
+                page.get_by_text(opener, exact=False).first.click(); wait_idle(page); break
+        except: pass
+
+    # جرّب الصيغ المختلفة
+    for label in candidates:
+        xpath = (
+            f"//button[normalize-space()='{label}' or contains(., '{label}')]"
+            f"|//div[normalize-space()='{label}' or contains(., '{label}')]"
+            f"|//span[normalize-space()='{label}' or contains(., '{label}')]"
+            f"|//*[@role='option' and (normalize-space()='{label}' or contains(., '{label}'))]"
+        )
+        try:
+            loc = page.locator(xpath).first
+            if loc.count():
+                try: loc.scroll_into_view_if_needed(timeout=4000)
+                except: pass
+                loc.click(timeout=TIMEOUT_MS)
+                wait_idle(page)
+                log(f"✅ picked time: {label}")
+                return True
+        except: pass
+
+    # احتياط: أي زر فيه نقطتا الوقت
+    try:
+        any_slot = page.locator("button:has-text(':'), [role='option']:has-text(':')").first
+        if any_slot.count():
+            any_slot.click(timeout=TIMEOUT_MS); wait_idle(page)
+            log("✅ picked a visible time slot (fallback).")
+            return True
+    except: pass
+
+    log("⚠️ no time slot found")
+    return False
+
+# ================= زيادة التذاكر +5 =================
 def bump_tickets(page, count=5):
-    # زر +
-    plus_candidates = [
+    log(f"🎟️ increase tickets by {count} …")
+    selectors = [
+        "button[aria-label*='increase']",
+        "button[aria-label*='plus']",
         "button:has-text('+')",
-        "button[aria-label*='+']",
-        "button[aria-label*='زيادة']",
-        "button[aria-label*='زيد']",
+        "button[class*='plus']",
+        "[role=button]:has-text('+')",
         "[data-testid*='plus']",
     ]
-    for q in plus_candidates:
-        loc = page.locator(q)
-        if loc.count() and loc.first.is_visible():
-            btn = loc.first
-            for i in range(count):
-                btn.click()
-                snooze(0.15, 0.35)
-            log(f"✅ تم زيادة العداد {count} مرات")
-            return True
-    log("⚠️ لم أجد زر +")
-    return False
+    plus = None
+    for sel in selectors:
+        loc = page.locator(sel).first
+        if loc.count() and loc.is_visible():
+            plus = loc; break
 
+    if not plus:
+        log("⚠️ plus button not found")
+        return False
+
+    for i in range(count):
+        try:
+            plus.click(timeout=TIMEOUT_MS)
+            log(f"➕ plus click {i+1}/{count}")
+            snooze(0.15, 0.35)
+        except Exception as e:
+            log(f"⚠️ plus click failed {i+1}: {e}")
+    return True
+
+# ================= متابعة/التالي =================
 def proceed_next(page):
-    # متابعة / التالي / الدفع
-    labels = ["متابعة", "التالي", "استمرار", "Checkout", "Continue", "الدفع"]
+    labels = ["متابعة","التالي","استمرار","Checkout","Continue","التالي ›","Confirm","إتمام","حجز"]
     for txt in labels:
-        if click_if_visible(page, f"button:has-text('{txt}'), a:has-text('{txt}')", txt):
+        if click_with_retry(page, f"button:has-text('{txt}'), a:has-text('{txt}')", name=f"'{txt}'"):
             return True
+    log("⚠️ next/continue button not found")
     return False
 
-# ========= التشغيل الرئيسي =========
+# ================= التشغيل الرئيسي =================
 def run():
+    os.makedirs(f"{ART_DIR}/videos", exist_ok=True)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-            ],
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
         )
         context = browser.new_context(
+            viewport={"width":1366,"height":768},
             locale="ar-SA",
             timezone_id="Asia/Riyadh",
-            record_video_dir=ART_DIR,
-            record_video_size={"width": 1280, "height": 720},
+            record_video_dir=f"{ART_DIR}/videos",
+            record_video_size={"width":1366,"height":768},
+            extra_http_headers={"Accept-Language":"ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"}
         )
+        context.set_default_timeout(TIMEOUT_MS)
         page = context.new_page()
-        page.set_default_timeout(30000)
+        page.on("response", lambda r: log(f"[HTTP] {r.status} {r.url}"))
 
         try:
-            log("🌐 فتح الصفحة الرئيسية")
-            go_home(page)
-
-            # إذا واجه 404 مباشرة، حاول الذهاب إلى الصفحة العربية مجددًا
-            if looks_like_404(page):
-                page.goto(HOME_URL, wait_until="domcontentloaded")
-                reload_if_404(page)
-
-            # بحث وفتح الفعالية
+            # 1) الصفحة الرئيسية + كوكيز + بحث
+            open_home(page)
             if not search_event(page, SEARCH_QUERY):
-                # محاولة أخيرة بفتح مسار الفعالية مباشرة
-                page.goto("https://webook.com/ar/zones/suwaidi-park-rs25", wait_until="domcontentloaded")
+                log("⚠️ search failed, try direct zone URL")
+                page.goto("https://webook.com/ar/zones/suwaidi-park-rs25", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
                 reload_if_404(page)
                 wait_idle(page)
 
-            # فتح صفحة الحجز
+            # 2) الذهاب لصفحة الحجز
             if not open_booking(page):
-                log("❌ لم أستطع فتح صفحة الحجز")
-            else:
-                wait_idle(page)
+                page.screenshot(path=f"{ART_DIR}/final.png", full_page=True)
+                return
 
-            # اختيار وقت 16:00
-            pick_time_slot(page)
+            # 3) تسجيل الدخول إن طُلب
+            if not ensure_login_if_needed(page):
+                page.screenshot(path=f"{ART_DIR}/final.png", full_page=True)
+                return
 
-            # لو ظهر تسجيل الدخول — أدخله
-            ensure_login_if_needed(page)
+            # 4) اختيار الوقت 16:00 (مرتين كمحاولة)
+            if not choose_time_slot(page):
+                snooze(0.8, 1.4)
+                choose_time_slot(page)
 
-            # جرّب زيادة التذاكر 5 مرات
+            # 5) زيادة التذاكر +5
             bump_tickets(page, count=5)
 
-            # تابع/التالي إن وُجد
+            # 6) متابعة/التالي
             proceed_next(page)
 
             # لقطة نهائية
             page.screenshot(path=f"{ART_DIR}/final.png", full_page=True)
-            log("📸 تم حفظ لقطة الشاشة في artifacts/final.png")
+            log("📸 saved artifacts/final.png")
+
+            # انتظر قليلًا قبل الإغلاق لرؤية النتيجة في الفيديو
+            log(f"⏳ holding {HOLD_SECONDS}s before closing…")
+            time.sleep(HOLD_SECONDS)
 
         finally:
             try:
-                # أعطِ بعض الوقت ليُحفظ الفيديو
-                page.wait_for_timeout(1200)
+                v = page.video
             except Exception:
-                pass
-            context.close()
-            browser.close()
-            log("✅ انتهى تشغيل البوت")
+                v = None
+            try: page.close()
+            except: pass
+            try:
+                if v: v.save_as(f"{ART_DIR}/videos/session.webm")
+            except Exception as e:
+                log(f"⚠️ video save err: {e}")
+            context.close(); browser.close()
+            log("✅ done.")
 
 if __name__ == "__main__":
     run()
