@@ -1,17 +1,15 @@
 # webook_bot.py
-# فيديو + تتبّع + تجاوز 404 + دعم تواريخ عربي/إنجليزي
-
+# فيديو للجلسة + تتبّع + تجاوز 404 + دعم تواريخ عربية/إنجليزية
 import os, re, sys, time
 from datetime import datetime, timedelta, date
-from typing import List
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ========= متغيرات البيئة =========
-EVENT_URL = os.getenv("EVENT_URL", "").strip()
-START_DATE = os.getenv("START_DATE", "").strip()   # مثل: 2025-11-03
-END_DATE   = os.getenv("END_DATE", "").strip()     # مثل: 2025-11-06
+EVENT_URL = os.getenv("EVENT_URL", "").strip()     # ضع رابط صفحة الحجز نفسه
+START_DATE = os.getenv("START_DATE", "").strip()   # مثال: 2025-11-03
+END_DATE   = os.getenv("END_DATE", "").strip()     # مثال: 2025-11-06
 TIME_RANGE = os.getenv("TIME_RANGE", "00:00 - 16:00").strip()
-PROXY_URL  = os.getenv("PROXY_URL", "").strip()    # اختياري
+PROXY_URL  = os.getenv("PROXY_URL", "").strip()    # اختياري (سر في GitHub)
 
 if not EVENT_URL:
     print("❌ EVENT_URL مفقود.")
@@ -26,7 +24,6 @@ try:
 except Exception as e:
     print(f"❌ تاريخ غير صالح: {e}")
     sys.exit(2)
-
 if end_date < start_date:
     start_date, end_date = end_date, start_date
 
@@ -34,14 +31,14 @@ if end_date < start_date:
 AR_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 MONTHS_EN_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 MONTHS_EN_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"]
-def month_ar(m: int) -> str:
-    return {1:"يناير",2:"فبراير",3:"مارس",4:"أبريل",5:"مايو",6:"يونيو",7:"يوليو",8:"أغسطس",9:"سبتمبر",10:"أكتوبر",11:"نوفمبر",12:"ديسمبر"}[m]
+AR_MONTH = {1:"يناير",2:"فبراير",3:"مارس",4:"أبريل",5:"مايو",6:"يونيو",7:"يوليو",8:"أغسطس",9:"سبتمبر",10:"أكتوبر",11:"نوفمبر",12:"ديسمبر"}
 
 def day_variants(d: date):
     day2 = f"{d.day:02d}"; day1 = str(d.day)
     day_ar2 = day2.translate(AR_DIGITS); day_ar1 = day1.translate(AR_DIGITS)
-    en_s = MONTHS_EN_SHORT[d.month-1]; en_l = MONTHS_EN_LONG[d.month-1]; ar_l = month_ar(d.month)
+    en_s = MONTHS_EN_SHORT[d.month-1]; en_l = MONTHS_EN_LONG[d.month-1]; ar_l = AR_MONTH[d.month]
     iso  = d.strftime("%Y-%m-%d")
+    # جميع الصيغ المحتملة للنص الذي يظهر على زر التاريخ
     return list({
         f"{day2} {en_s}", f"{day1} {en_s}", f"{day2} {en_s.upper()}",
         f"{day2} {en_l}", f"{day1} {en_l}", f"{day2} {en_l.upper()}",
@@ -80,6 +77,7 @@ def open_with_fallback(page, url, tries=3, label="primary"):
 def click_date(page, d: date, timeout_ms=60000) -> bool:
     variants = day_variants(d)
     iso = d.strftime("%Y-%m-%d")
+    # جرّب عبر خصائص شائعة أولًا
     css_candidates = [
         f'[data-date="{iso}"]', f'button[data-date="{iso}"]',
         f'[aria-label*="{iso}"]', f'button[aria-label*="{iso}"]',
@@ -94,6 +92,7 @@ def click_date(page, d: date, timeout_ms=60000) -> bool:
                 print(f"✅ Clicked via selector: {sel}")
                 return True
         except: pass
+    # ثم by role name
     for v in variants:
         try:
             loc = page.get_by_role("button", name=re.compile(re.escape(v), re.I)).first
@@ -102,6 +101,7 @@ def click_date(page, d: date, timeout_ms=60000) -> bool:
                 print(f"✅ Clicked by role/button: {v}")
                 return True
         except: pass
+    # ثم بالنص الظاهر
     for v in variants:
         try:
             loc = page.get_by_text(re.compile(re.escape(v), re.I)).first
@@ -113,11 +113,10 @@ def click_date(page, d: date, timeout_ms=60000) -> bool:
     print(f"⚠️ لم يتم العثور على اليوم {d.isoformat()}")
     return False
 
-def ensure_dirs():
+def run_bot():
+    # تأكد من مجلدات اللقطات والفيديو قبل أي تنقّل
     os.makedirs("artifacts/videos", exist_ok=True)
 
-def run_bot():
-    ensure_dirs()
     with sync_playwright() as p:
         launch_kwargs = {
             "headless": "new",
@@ -129,39 +128,35 @@ def run_bot():
 
         browser = p.chromium.launch(**launch_kwargs)
 
-        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/127.0.0.0 Safari/537.36")
-
-        # تسجيل الفيديو داخل artifacts/videos + تتبّع
+        # إنشاء context مع تشغيل الفيديو قبل أي تنقّل
         context = browser.new_context(
-            user_agent=ua,
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/127.0.0.0 Safari/537.36"),
             viewport={"width": 1366, "height": 768},
             locale="ar-SA",
             timezone_id="Asia/Riyadh",
-            geolocation={"latitude": 24.7136, "longitude": 46.6753},
-            permissions=["geolocation"],
             record_video_dir="artifacts/videos",
             record_video_size={"width": 1366, "height": 768},
         )
+        # ابدأ التتبّع قبل أي تنقّل
         context.tracing.start(screenshots=True, snapshots=True, sources=False)
 
         page = context.new_page()
         page.on("response", lambda r: print(f"[HTTP] {r.status()} {r.url}"))
 
         try:
-            # ابدأ من الهوم
+            # ابدأ من الهوم لتوليد جلسة + كوكيز
             print("🏠 فتح الصفحة الرئيسية...")
             page.goto("https://webook.com/", wait_until="domcontentloaded", timeout=60000)
-            time.sleep(1.2)
-            # كوكيز
+            time.sleep(1.0)
             try:
                 cookie_btn = page.locator("button:has-text('قبول'), button:has-text('Accept'), button:has-text('رفض')")
                 if cookie_btn.first.is_visible():
-                    cookie_btn.first.click(); print("✅ تعاملت مع الكوكيز"); time.sleep(0.8)
+                    cookie_btn.first.click(); print("✅ تعاملت مع الكوكيز"); time.sleep(0.6)
             except: pass
 
-            # افتح الرابط + بدائل
+            # جرّب الرابط الأساسي → ثم بدون /ar/ → ثم /en/
             status = open_with_fallback(page, EVENT_URL, label="primary")
             if status == 404:
                 no_locale = EVENT_URL.replace("/ar/", "/")
@@ -174,7 +169,6 @@ def run_bot():
 
             if status == 200:
                 print("✅ الصفحة فتحت — نبدأ اختيار الأيام")
-                # الفترة الزمنية (اختياري)
                 if TIME_RANGE:
                     try:
                         page.get_by_role("button", name=re.compile(re.escape(TIME_RANGE), re.I)).first.click(timeout=5000)
@@ -185,7 +179,6 @@ def run_bot():
                             print(f"⏰ اخترت الفترة (بالنص): {TIME_RANGE}")
                         except Exception:
                             print("ℹ️ لم أجد عنصر الفترة — متابعة")
-                # الأيام
                 cur = start_date
                 while cur <= end_date:
                     print(f"--- محاولة الحجز لـ {cur.isoformat()} ---")
@@ -196,38 +189,40 @@ def run_bot():
             else:
                 print("❌ بقيت 404 — راجع الفيديو و trace.zip لمعرفة السبب.")
 
-            # لقطة نهائية
+            # لقطة نهائية دائمًا
             try:
                 page.screenshot(path="artifacts/final.png", full_page=True)
                 print("📸 محفوظ: artifacts/final.png")
             except Exception as e:
-                print(f"ℹ️ لم أستطع حفظ الصورة: {e}")
+                print(f"ℹ️ تعذّر حفظ الصورة: {e}")
 
         finally:
-            # احفظ الـtrace
+            # أوقف التتبّع واحفظه
             try:
                 context.tracing.stop(path="trace.zip")
                 print("🧭 Saved trace.zip")
             except Exception as e:
                 print(f"ℹ️ trace stop err: {e}")
 
-            # اغلاق الصفحة ثم حفظ الفيديو باسم ثابت
+            # احفظ الفيديو باسم ثابت بعد إغلاق الصفحة
             video_saved = None
             try:
-                video = page.video
+                video = page.video  # خذ المقبض قبل الإغلاق
             except Exception:
                 video = None
             try:
                 page.close()
-            except: pass
+            except Exception:
+                pass
             try:
                 if video:
-                    # احفظه باسم ثابت داخل artifacts/videos/
                     video.save_as("artifacts/videos/session.webm")
                     video_saved = "artifacts/videos/session.webm"
                     print(f"🎥 Saved video -> {video_saved}")
+                else:
+                    print("⚠️ لا يوجد فيديو — تحقق من record_video_* في new_context.")
             except Exception as e:
-                print(f"ℹ️ video save err: {e}")
+                print(f"⚠️ video save err: {e}")
 
             context.close()
             browser.close()
