@@ -1,148 +1,168 @@
-# -*- coding: utf-8 -*-
-"""
-webook_bot.py  —  Single-file Webook booking bot (Playwright)
+# webook_bot.py
+# سكربت الحجز التلقائي يدعم التواريخ العربية والإنجليزية وصيغ ISO
+import os, re, sys, time
+from datetime import datetime, timedelta, date
+from typing import List
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-How to run (locally / Replit):
-1) pip install playwright
-2) python -m playwright install --with-deps chromium
-3) Set environment variables (recommended):
-   - WEBOOK_EMAIL
-   - WEBOOK_PASSWORD
-4) python webook_bot.py
+# ========== إعدادات من المتغيرات ==========
+EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
+PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
+EVENT_URL = os.getenv("EVENT_URL", "").strip()
 
-Notes:
-- This script logs in to Webook, opens the Al-Suwaidi Park booking page,
-  then books 5 tickets for each day listed in DAYS using TIME_TEXT.
-- It tries to click "Reject all" cookies banner if present.
-- Adjust DAYS / TIME_TEXT / TICKETS below if needed.
-"""
+START_DATE = os.getenv("START_DATE", "").strip()   # مثال: 2025-11-03
+END_DATE   = os.getenv("END_DATE", "").strip()     # مثال: 2025-11-06
+TIME_RANGE = os.getenv("TIME_RANGE", "00:00 - 16:00").strip()
 
-import os
-import sys
-import asyncio
-from playwright.async_api import async_playwright
+if not EMAIL or not PASSWORD:
+    print("❌ ERROR: WEBOOK_EMAIL / WEBOOK_PASSWORD غير مهيأة.")
+    sys.exit(2)
+if not EVENT_URL:
+    print("❌ ERROR: EVENT_URL غير مهيأ.")
+    sys.exit(2)
 
-LOGIN_URL = "https://webook.com/en/login?redirect=%2Fen%2Fzones%2Fsuwaidi-park-rs25"
-EVENT_URL = "https://webook.com/en/zones/suwaidi-park-rs25/book"
+def parse_iso(d: str) -> date:
+    return datetime.strptime(d, "%Y-%m-%d").date()
 
-# Read credentials from environment variables for safety
-EMAIL = os.getenv("WEBOOK_EMAIL", "")
-PASSWORD = os.getenv("WEBOOK_PASSWORD", "")
+try:
+    start_date = parse_iso(START_DATE)
+    end_date   = parse_iso(END_DATE) if END_DATE else start_date
+except Exception as e:
+    print(f"❌ ERROR: تاريخ غير صالح: {e}")
+    sys.exit(2)
 
-# --- Booking settings ---
-DAYS = ["02 NOV", "03 NOV", "04 NOV", "05 NOV"]  # days to book
-TIME_TEXT = "16:00 - 00:00"                      # time slot
-TICKETS = 5                                      # tickets per day
+if end_date < start_date:
+    start_date, end_date = end_date, start_date
 
-async def click_if_visible(page, selector, timeout=2000):
-    """Click a locator if it becomes visible; return True if clicked."""
-    try:
-        el = page.locator(selector)
-        await el.first.wait_for(state="visible", timeout=timeout)
-        await el.first.click()
-        return True
-    except Exception:
-        return False
+# ========== أسماء الأشهر ==========
+AR_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
-async def run():
-    if not EMAIL or not PASSWORD:
-        print("ERROR: Please set WEBOOK_EMAIL and WEBOOK_PASSWORD environment variables.", file=sys.stderr)
-        sys.exit(2)
+MONTHS_EN_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTHS_EN_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+MONTHS_AR_LONG  = ["يناير","فبراير","مارس","أبريل","ابريل","مايو","يونيو","يوليو","أغسطس","اغسطس","سبتمبر","أكتوبر","اكتوبر","نوفمبر","ديسمبر"]
 
-    async with async_playwright() as p:
-        # Launch Chromium; --no-sandbox helps CI environments
-        browser = await p.chromium.launch(headless=False, args=["--no-sandbox"])
-        context = await browser.new_context()
-        page = await context.new_page()
+def month_ar(month_num: int) -> str:
+    mapping = {
+        1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل",
+        5: "مايو", 6: "يونيو", 7: "يوليو", 8: "أغسطس",
+        9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+    }
+    return mapping.get(month_num, "")
 
-        # 1) Go to login page
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+def day_variants(d: date) -> List[str]:
+    """ترجع كل الصيغ المحتملة لزر التاريخ"""
+    day = f"{d.day:02d}"
+    dd_ar = day.translate(AR_DIGITS)
+    month_en_s = MONTHS_EN_SHORT[d.month-1]
+    month_en_l = MONTHS_EN_LONG[d.month-1]
+    month_ar_l = month_ar(d.month)
+    iso = d.strftime("%Y-%m-%d")
 
-        # Try to reject cookies if banner appears
-        for txt in ["Reject all", "Reject All", "رفض الكل"]:
-            if await click_if_visible(page, f"text={txt}", timeout=2500):
-                break
+    variants = [
+        f"{day} {month_en_s}", f"{day} {month_en_s.upper()}",
+        f"{day} {month_en_l}", f"{day} {month_en_l.upper()}",
+        f"{day} {month_ar_l}", f"{dd_ar} {month_ar_l}",
+        day, dd_ar, iso
+    ]
+    return list(set(variants))
 
-        # Fill login form (robust selectors)
-        await page.fill('input[type="email"], input[autocomplete="username"], input[placeholder*="Email" i]', EMAIL)
-        await page.fill('input[type="password"], input[autocomplete="current-password"], input[placeholder*="Password" i]', PASSWORD)
+def click_date(page, d: date, timeout_ms=60000) -> bool:
+    """يحاول نقر اليوم بكل الصيغ الممكنة"""
+    variants = day_variants(d)
+    iso = d.strftime("%Y-%m-%d")
 
-        # Click a likely login button
-        for btn in ["Login", "Sign in", "تسجيل الدخول"]:
-            if await click_if_visible(page, f"button:has-text('{btn}')", timeout=2000):
-                break
+    selectors = []
+    for v in variants:
+        selectors += [
+            f'[data-date="{v}"]', f'[aria-label*="{v}"]',
+            f'button[aria-label*="{v}"]', f'[data-day*="{v}"]',
+        ]
+    selectors.append(f'[data-date="{iso}"]')
 
-        # Wait a bit for redirect
-        await page.wait_for_timeout(3500)
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"✅ Clicked via selector: {sel}")
+                return True
+        except Exception:
+            pass
 
-        # 2) Open event booking page
-        await page.goto(EVENT_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1000)
+    for v in variants:
+        try:
+            loc = page.get_by_role("button", name=re.compile(v, re.I)).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"✅ Clicked by role/button: {v}")
+                return True
+        except Exception:
+            pass
 
-        # Attempt cookies rejection again on event page
-        for txt in ["Reject all", "Reject All", "رفض الكل"]:
-            if await click_if_visible(page, f"text={txt}", timeout=1500):
-                break
+    for v in variants:
+        try:
+            loc = page.get_by_text(re.compile(v, re.I)).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"✅ Clicked by text: {v}")
+                return True
+        except Exception:
+            pass
 
-        async def book_day(day_text: str):
-            print(f"--- Booking {day_text} ---")
+    print(f"⚠️ لم يتم العثور على اليوم {d.isoformat()}")
+    return False
 
-            # Select day
-            await page.get_by_text(day_text, exact=False).first.click()
-            await page.wait_for_timeout(800)
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(locale="ar-SA")
+        page = context.new_page()
 
-            # Select time slot
-            await page.get_by_text(TIME_TEXT, exact=False).first.click()
-            await page.wait_for_timeout(1200)
+        print(f"🌐 فتح الصفحة: {EVENT_URL}")
+        page.goto(EVENT_URL, timeout=120_000)
+        page.wait_for_load_state("networkidle", timeout=120_000)
 
-            # Ensure ticket count is 0 then increase to TICKETS
-            minus = page.locator("button:has-text('-'), [aria-label='decrease'], button[title*='decrease' i]")
-            for _ in range(6):
-                try:
-                    await minus.first.click(timeout=400)
-                except Exception:
-                    break
+        # محاولة قبول الكوكيز إن وجدت
+        try:
+            page.get_by_role("button", name=re.compile("قبول|أوافق|Accept", re.I)).click(timeout=3000)
+            print("✅ تم قبول الكوكيز")
+        except:
+            pass
 
-            plus = page.locator("button:has-text('+'), [aria-label='increase'], button[title*='increase' i]")
-            for _ in range(TICKETS):
-                await plus.first.click()
-                await page.wait_for_timeout(120)
-
-            # Go to checkout
-            for txt in ["Next: Checkout", "Checkout", "Next", "التالي"]:
-                if await click_if_visible(page, f"button:has-text('{txt}')", timeout=2000):
-                    break
-            await page.wait_for_timeout(1200)
-
-            # Accept terms if present
-            await page.mouse.wheel(0, 1600)
-            terms = page.locator("input[type='checkbox']")
+        # اختيار النطاق الزمني
+        if TIME_RANGE:
             try:
-                if await terms.count() > 0:
-                    await terms.first.check(timeout=1200)
-            except Exception:
-                await click_if_visible(page, "text=Terms", timeout=800)
+                page.get_by_text(TIME_RANGE, exact=False).first.click(timeout=3000)
+                print(f"⏰ اخترت الفترة: {TIME_RANGE}")
+            except:
+                print("ℹ️ لم يتم العثور على عنصر الفترة الزمنية")
 
-            # Confirm / complete booking
-            for txt in ["Complete booking", "Confirm", "Complete", "إتمام"]:
-                if await click_if_visible(page, f"button:has-text('{txt}')", timeout=2000):
-                    break
+        # الحجز
+        cur = start_date
+        while cur <= end_date:
+            print(f"--- محاولة الحجز لـ {cur.isoformat()} ---")
+            if not click_date(page, cur):
+                print(f"⚠️ فشل في النقر على {cur}")
+            cur += timedelta(days=1)
 
-            # Back to event page for next day
-            await page.wait_for_timeout(1500)
-            await page.goto(EVENT_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(700)
+        # التقاط صورة نهائية
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            page.screenshot(path="artifacts/final.png", full_page=True)
+            print("📸 تم حفظ لقطة الشاشة في artifacts/final.png")
+        except Exception as e:
+            print(f"⚠️ لم أستطع حفظ الصورة: {e}")
 
-        # Loop over all days
-        for d in DAYS:
-            try:
-                await book_day(d)
-                print(f"✅ Done {d}")
-            except Exception as e:
-                print(f"⚠️ Failed {d}: {e}", file=sys.stderr)
-
-        await context.close()
-        await browser.close()
+        context.close()
+        browser.close()
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        run()
+        sys.exit(0)
+    except PWTimeout as e:
+        print(f"❌ Timeout error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ خطأ عام: {e}")
+        sys.exit(1)
