@@ -36,12 +36,13 @@ jobs:
           START_DATE: "2025-11-03"
           END_DATE: "2025-11-06"
           TIME_RANGE: "00:00 - 16:00"
-          EVENT_URL: "https://webook.com/ar/..."  # ضع رابط صفحة الحجز هنا
+          EVENT_URL: "https://webook.com/ar/..."   # ضع هنا رابط الحدث الصحيح
         run: |
           set -x
           mkdir -p artifacts
           xvfb-run -a python webook_bot.py | tee artifacts/bot.log
-- name: رفع اللقطات والملفات التشخيصية
+
+      - name: رفع اللقطات والملفات التشخيصية
         uses: actions/upload-artifact@v4
         with:
           name: run-artifacts
