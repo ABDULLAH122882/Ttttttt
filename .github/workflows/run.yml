@@ -1,43 +1,227 @@
-name: Run Webook Bot
+# webook_bot.py
+# تشغيل يدوي من GitHub Actions مع متانة أعلى لاختيار التاريخ (عربي/إنجليزي/ISO)
+import os, re, sys, time
+from datetime import datetime, timedelta, date
+from typing import List
 
-on:
-  workflow_dispatch: {}   # تشغيل يدوي فقط (بدون تشغيل تلقائي)
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
+# ========== إعدادات من المتغيرات ==========
+EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
+PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
+EVENT_URL = os.getenv("EVENT_URL", "").strip()
 
-    steps:
-      - name: تنزيل الملفات
-        uses: actions/checkout@v4
+# نطاق التاريخ
+START_DATE = os.getenv("START_DATE", "").strip()   # مثال: 2025-11-03
+END_DATE   = os.getenv("END_DATE", "").strip()     # مثال: 2025-11-06
+TIME_RANGE = os.getenv("TIME_RANGE", "00:00 - 16:00").strip()
 
-      - name: إعداد Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+if not EMAIL or not PASSWORD:
+    print("ERROR: WEBOOK_EMAIL / WEBOOK_PASSWORD غير مهيأة.")
+    sys.exit(2)
+if not EVENT_URL:
+    print("ERROR: EVENT_URL غير مهيأ.")
+    sys.exit(2)
 
-      - name: تثبيت التبعيات اللازمة للنظام
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 \
-              libcups2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
-              libasound2t64 libxshmfence1 libgbm1 fonts-liberation
+def parse_iso(d: str) -> date:
+    return datetime.strptime(d, "%Y-%m-%d").date()
 
-      - name: تثبيت مكتبات Python
-        run: |
-          pip install --upgrade pip
-          pip install playwright
-          python -m playwright install --with-deps chromium
+try:
+    start_date = parse_iso(START_DATE)
+    end_date   = parse_iso(END_DATE) if END_DATE else start_date
+except Exception as e:
+    print(f"ERROR: تواريخ غير صحيحة: {e}")
+    sys.exit(2)
 
-      - name: تشغيل البوت (يدويًا)
-        env:
-          WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
-          WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
-          START_DATE: "2025-11-03"
-          END_DATE: "2025-11-06"
-          TIME_RANGE: "00:00 - 16:00"
-          EVENT_URL: "https://webook.com/ar/..."   # ضع هنا رابط الحدث
-        run: |
-          set -x
-          mkdir -p artifacts
-          xvfb-run -a python webook_bot.py | tee artifacts/bot.log
+if end_date < start_date:
+    start_date, end_date = end_date, start_date
+
+# ========== تحويلات وعناوين ==========
+AR_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+# أشهر بالعربي والإنجليزي (قصير/كامل)
+MONTHS_EN_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTHS_EN_LONG  = ["January","February","March","April","May","June",
+                   "July","August","September","October","November","December"]
+MONTHS_AR_LONG  = ["يناير","فبراير","مارس","أبريل","ابريل","مايو","يونيو",
+                   "يوليو","أغسطس","اغسطس","سبتمبر","أكتوبر","اكتوبر","نوفمبر","ديسمبر"]
+
+def day_variants(d: date) -> List[str]:
+    """ترجع كل صيغ النص الممكنة لزر التاريخ."""
+    day     = d.day
+    month_i = d.month - 1
+
+    en_short = MONTHS_EN_SHORT[month_i]
+    en_long  = MONTHS_EN_LONG[month_i]
+    # بالعربي قد يظهر فقط اسم الشهر (نوفمبر) بدون سنة
+    ar_names = [m for m in MONTHS_AR_LONG if ("نوفمبر" in m if d.month==11 else True)]
+    # لتبسيط: اختَر الاسم العربي الطويل الأساسي لو كان موجودًا
+    ar_main  = "نوفمبر" if d.month==11 else None
+    if d.month == 1:  ar_main = "يناير"
+    if d.month == 2:  ar_main = "فبراير"
+    if d.month == 3:  ar_main = "مارس"
+    if d.month == 4:  ar_main = "أبريل"  # أحياناً "ابريل"
+    if d.month == 5:  ar_main = "مايو"
+    if d.month == 6:  ar_main = "يونيو"
+    if d.month == 7:  ar_main = "يوليو"
+    if d.month == 8:  ar_main = "أغسطس"  # أحياناً "اغسطس"
+    if d.month == 9:  ar_main = "سبتمبر"
+    if d.month == 10: ar_main = "أكتوبر"  # أحياناً "اكتوبر"
+    if d.month == 12: ar_main = "ديسمبر"
+
+    dd = f"{day:02d}"
+    dd_ar = dd.translate(AR_DIGITS)
+    iso = d.strftime("%Y-%m-%d")
+
+    variants = set()
+
+    # إنجليزي
+    variants.add(f"{dd} {en_short}".upper())      # 03 NOV
+    variants.add(f"{dd} {en_long}".upper())       # 03 NOVEMBER
+    variants.add(f"{dd} {en_short}")              # 03 Nov
+    variants.add(f"{dd} {en_long}")               # 03 November
+
+    # عربي
+    if ar_main:
+        variants.add(f"{dd} {ar_main}")           # 03 نوفمبر
+        variants.add(f"{dd_ar} {ar_main}")        # ٠٣ نوفمبر (أرقام عربية)
+
+    # أحياناً يظهر فقط اليوم داخل زر اليوم، مع الشهر في الأعلى — سنجرّب اليوم وحده
+    variants.add(dd)
+    variants.add(dd_ar)
+
+    # نعيد أيضًا ISO لاستخدامه مع data-date/aria-label
+    variants.add(iso)
+
+    return list(variants)
+
+# ========== دوال نقر التاريخ بمرونة ==========
+def click_date(page, d: date, timeout_ms=60000) -> bool:
+    """
+    يحاول نقر تاريخ d سواء كان مكتوباً بالعربي/الإنجليزي أو موجوداً كقيمة في attributes.
+    يرجع True إذا تمكن من النقر.
+    """
+    variants = day_variants(d)
+    iso = d.strftime("%Y-%m-%d")
+    # أنماط CSS محتملة لخصائص شائعة
+    css_candidates = [
+        f'[data-date="{iso}"]',
+        f'button[data-date="{iso}"]',
+        f'[aria-label*="{iso}"]',
+    ]
+
+    # لو في aria-label بالنص الطبيعي، جرّب العربي/الإنجليزي
+    for v in variants:
+        css_candidates.append(f'[aria-label*="{v}"]')
+        css_candidates.append(f'button[aria-label*="{v}"]')
+
+    tried = []
+
+    # 1) CSS locators
+    for sel in css_candidates:
+        try:
+            tried.append(f"CSS {sel}")
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"[OK] Clicked by CSS: {sel}")
+                return True
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+
+    # 2) By role=button + name (يدعم regex)
+    for v in variants:
+        try:
+            tried.append(f'ROLE name="{v}"')
+            loc = page.get_by_role("button", name=re.compile(re.escape(v), re.IGNORECASE)).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"[OK] Clicked by ROLE name: {v}")
+                return True
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+
+    # 3) بالنص المباشر (get_by_text)
+    for v in variants:
+        try:
+            tried.append(f'TEXT "{v}"')
+            loc = page.get_by_text(re.compile(re.escape(v), re.IGNORECASE)).first
+            if loc.count() and loc.is_enabled():
+                loc.click(timeout=timeout_ms)
+                print(f"[OK] Clicked by TEXT: {v}")
+                return True
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+
+    print(f"[WARN] لم أستطع إيجاد تاريخ {d.isoformat()}. المحاولات:\n- " + "\n- ".join(tried))
+    return False
+
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(locale="ar-EG")  # إجبار الواجهة العربية قدر الإمكان
+        page = context.new_page()
+
+        # 1) افتح صفحة الفعالية
+        print(f"Open: {EVENT_URL}")
+        page.goto(EVENT_URL, timeout=120_000)
+        page.wait_for_load_state("networkidle", timeout=120_000)
+
+        # (اختياري) لو فيه زر قبول الكوكيز
+        try:
+            page.get_by_role("button", name=re.compile("قبول|أوافق|Accept", re.I)).click(timeout=3000)
+        except:
+            pass
+
+        # 2) لو فيه تسجيل دخول بصفحة منفصلة — عدّل هذه المنطقة حسب موقعك
+        #    تركتها بدون تنفيذ لأن مواقع كثيرة لا تحتاج تسجيل قبل اختيار التذاكر.
+        #    إن كان موقعك يشترط، أضف خطوات تعبئة البريد/كلمة السر هنا.
+
+        # 3) اختر المدى الزمني إن كان موجودًا (اختياري)
+        if TIME_RANGE:
+            try:
+                page.get_by_text(TIME_RANGE, exact=False).first.click(timeout=3000)
+                print(f"[OK] اخترت الفترة: {TIME_RANGE}")
+            except:
+                print("[INFO] لم أجد عنصر الفترة الزمنية — تخطّيت.")
+
+        # 4) حاول نقر كل الأيام في النطاق
+        cur = start_date
+        while cur <= end_date:
+            print(f"--- Booking {cur.isoformat()} ---")
+            ok = click_date(page, cur)
+            if not ok:
+                print(f"[WARN] تعذر نقر {cur.isoformat()} — سأتابع.")
+            else:
+                # بعد اختيار اليوم، قد تحتاج لاختيار الشريحة الزمنية أو عدد التذاكر...
+                # أضف أي خطوات مكملة هنا (مثل: اختيار 2 تذكرة، إضافة للسلة، إكمال الدفع...)
+                pass
+            cur += timedelta(days=1)
+
+        # 5) حفظ لقطات للتشخيص
+        try:
+            page.screenshot(path="artifacts/final.png", full_page=True)
+            print("[OK] Saved artifacts/final.png")
+        except:
+            pass
+
+        context.close()
+        browser.close()
+
+
+if __name__ == "__main__":
+    try:
+        run()
+        sys.exit(0)
+    except PWTimeout as e:
+        print(f"[ERROR] Timeout: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
