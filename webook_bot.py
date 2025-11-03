@@ -1,207 +1,200 @@
 # webook_bot.py
-# Bot مهيأ لحجز فعاليات WeBook مع سلوك بشري + فيديو + trace
-# ------------------------------------------------------------
-# Usage:
-# - ضع هذا الملف في نفس مجلد المشروع.
-# - اضبط المتغيرات البيئية في GitHub Actions أو محلياً:
-#    EVENT_URL (مثلاً "https://webook.com/ar/zones/suwaidi-park-rs25/book")
-#    START_DATE  (YYYY-MM-DD) مثلاً "2025-11-03"
-#    END_DATE    (YYYY-MM-DD) مثلاً "2025-11-06"
-#    WEBOOK_EMAIL, WEBOOK_PASSWORD  (اختياري: لتسجيل الدخول)
-#    PROXY_URL   (اختياري: http://user:pass@host:port)
-# - شغّل: python webook_bot.py
-# ------------------------------------------------------------
+# يفتح ويبـوك من الصفحة الرئيسية -> يبحث "حديقة السويدي" -> يدخل الفعالية -> يحاول الحجز
+# مع سلوك بشري + تسجيل فيديو + رفع لقطات وتشخيص
 
-import os, re, sys, time, math, random
+import os, re, sys, time, random
 from datetime import datetime, timedelta, date
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ---------- إعدادات من environment ----------
-EVENT_URL = os.getenv("EVENT_URL", "https://webook.com/ar/zones/suwaidi-park-rs25/book").strip()
-START_DATE = os.getenv("START_DATE", "").strip()   # e.g. "2025-11-03"
-END_DATE   = os.getenv("END_DATE", "").strip()     # e.g. "2025-11-06"
-WEBOOK_EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
-WEBOOK_PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+# ============== إعدادات من الـ env ==============
+START_DATE = os.getenv("START_DATE", "").strip()   # مثال: 2025-11-03
+END_DATE   = os.getenv("END_DATE", "").strip()     # مثال: 2025-11-06
+SEARCH_QUERY = os.getenv("SEARCH_QUERY", "حديقة السويدي").strip()
+PROXY_URL  = os.getenv("PROXY_URL", "").strip()    # اختياري
 TIMEOUT = 60000  # ms
 
-# ---------- Helpers ----------
-def log(*a, **k):
-    print(*a, **k, flush=True)
+# ============== أدوات صغيرة ==============
+def log(msg): print(msg, flush=True)
+def human_sleep(a=0.4, b=1.2): time.sleep(random.uniform(a, b))
 
-def human_sleep(a=0.4, b=1.2):
-    time.sleep(random.uniform(a, b))
-
-# user-agent pool
 UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
 ]
-def choose_ua():
-    return random.choice(UA_POOL)
+def choose_ua(): return random.choice(UA_POOL)
 
-# stealth JS لتقليل اكتشاف headless
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 window.chrome = window.chrome || { runtime: {} };
 const originalQuery = navigator.permissions && navigator.permissions.query;
 if (originalQuery) {
-  navigator.permissions.query = params => {
-    if (params && params.name === 'notifications') {
-      return Promise.resolve({ state: Notification.permission });
-    }
-    return originalQuery(params);
-  };
+  navigator.permissions.query = p => (p && p.name === 'notifications')
+    ? Promise.resolve({ state: Notification.permission })
+    : originalQuery(p);
 }
 """
 
-# حركة ماوس بشرية ومنحنية ثم نقرة
-def human_move_and_click(page, locator_or_box, steps=14):
+def human_move_and_click(page, locator, steps=14):
     try:
-        # locator_or_box can be a locator or bounding box dict
-        if isinstance(locator_or_box, dict):
-            box = locator_or_box
-        else:
-            box = locator_or_box.bounding_box()
+        box = locator.bounding_box()
     except Exception:
         box = None
-
     if not box:
         try:
-            # fallback to direct click
-            locator_or_box.click()
-            return
-        except:
-            return
-
-    target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
-    target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-    # start point: a bit away
-    cur_x = random.uniform(max(0, target_x-160), max(0, target_x-40))
-    cur_y = random.uniform(max(0, target_y-160), max(0, target_y-40))
+            locator.click()
+        except: pass
+        return
+    tx = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+    ty = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+    sx = max(0, tx - random.uniform(40, 160))
+    sy = max(0, ty - random.uniform(40, 160))
     for i in range(steps):
         t = (i+1)/steps
-        # small curve
-        step_x = cur_x + (target_x - cur_x) * (t**0.9) + random.uniform(-3,3)
-        step_y = cur_y + (target_y - cur_y) * (t**0.9) + random.uniform(-3,3)
-        try:
-            page.mouse.move(step_x, step_y)
-        except:
-            pass
+        nx = sx + (tx - sx) * (t**0.9) + random.uniform(-2,2)
+        ny = sy + (ty - sy) * (t**0.9) + random.uniform(-2,2)
+        try: page.mouse.move(nx, ny)
+        except: pass
         time.sleep(random.uniform(0.004, 0.02))
-        cur_x, cur_y = step_x, step_y
+        sx, sy = nx, ny
     try:
-        page.mouse.click(target_x, target_y, delay=random.uniform(20,120))
+        page.mouse.click(tx, ty, delay=random.uniform(20,120))
     except:
-        try:
-            # fallback locator click
-            if not isinstance(locator_or_box, dict):
-                locator_or_box.click()
-        except:
-            pass
+        try: locator.click()
+        except: pass
 
-# دوال للتاريخ (صيغ عربية وانجليزية وأرقام عربية)
+# ============== تواريخ (عربي/إنجليزي) ==============
 AR_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 MONTHS_EN_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 MONTHS_EN_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"]
 AR_MONTH = {1:"يناير",2:"فبراير",3:"مارس",4:"أبريل",5:"مايو",6:"يونيو",7:"يوليو",8:"أغسطس",9:"سبتمبر",10:"أكتوبر",11:"نوفمبر",12:"ديسمبر"}
 
 def parse_iso(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
+    try: return datetime.strptime(s, "%Y-%m-%d").date()
+    except: return None
 
-from datetime import datetime
 def date_variants(d: date):
-    day2 = f"{d.day:02d}"
-    day1 = str(d.day)
-    day_ar2 = day2.translate(AR_DIGITS)
-    day_ar1 = day1.translate(AR_DIGITS)
-    en_s = MONTHS_EN_SHORT[d.month-1]
-    en_l = MONTHS_EN_LONG[d.month-1]
-    ar_l = AR_MONTH[d.month]
-    iso = d.strftime("%Y-%m-%d")
+    day2 = f"{d.day:02d}"; day1 = str(d.day)
+    day_ar2 = day2.translate(AR_DIGITS); day_ar1 = day1.translate(AR_DIGITS)
+    en_s = MONTHS_EN_SHORT[d.month-1]; en_l = MONTHS_EN_LONG[d.month-1]; ar_l = AR_MONTH[d.month]
+    iso  = d.strftime("%Y-%m-%d")
     return list({iso, f"{day2} {en_s}", f"{day1} {en_s}", f"{day2} {en_l}", f"{day1} {en_l}",
-                 f"{day2} {ar_l}", f"{day1} {ar_l}", f"{day_ar2} {ar_l}", f"{day_ar1} {ar_l}", day2, day1})
+                 f"{day2} {ar_l}", f"{day1} {ar_l}", f"{day_ar2} {ar_l}", f"{day_ar1} {ar_l}",
+                 day2, day1})
 
-# ---------- إجراءات الصفحة ----------
-def accept_cookies(page):
-    # Try multiple variants
+# ============== تعاملات صفحة ==============
+def accept_cookies(scope):
     candidates = [
-        page.get_by_role("button", name=re.compile(r"قبول|أوافق|حسناً|أفهم|Accept|Agree", re.I)),
-        page.locator("button:has-text('قبول')"),
-        page.locator("button:has-text('Accept')"),
-        page.locator("button:has-text('رفض')"),
-        page.locator("text=قبول"),
+        scope.get_by_role("button", name=re.compile(r"قبول|أوافق|حسناً|أفهم|Accept|Agree|رفض|Reject", re.I)),
+        scope.locator("button:has-text('قبول')"),
+        scope.locator("button:has-text('Accept')"),
+        scope.locator("text=قبول"),
     ]
     for c in candidates:
         try:
             if c.count() and c.first.is_visible():
-                human_move_and_click(page, c.first)
-                human_sleep(0.5, 1.0)
+                human_move_and_click(scope, c.first); human_sleep(0.5, 1.0)
                 log("✅ تعاملت مع الكوكيز")
                 return True
-        except Exception:
-            pass
+        except: pass
     return False
 
-def login_if_needed(page):
-    # If login form present, fill and submit
-    try:
-        # Look for login form fields
-        email = page.locator("input[type='email'], input[name='email'], input[id*='email']").first
-        pwd   = page.locator("input[type='password'], input[name='password'], input[id*='password']").first
-        btn   = page.get_by_role("button", name=re.compile(r"Login|تسجيل الدخول|Sign in|Log in", re.I)).first
-        if email.count() and pwd.count():
-            if not WEBOOK_EMAIL or not WEBOOK_PASSWORD:
-                log("ℹ️ نموذج تسجيل دخول موجود لكن لم توفّر WEBOOK_EMAIL/WEBOOK_PASSWORD في الـenv.")
-                return False
-            try:
-                email.fill(WEBOOK_EMAIL, timeout=5000)
-                human_sleep(0.2, 0.6)
-                pwd.fill(WEBOOK_PASSWORD, timeout=5000)
-                human_sleep(0.3, 0.7)
-                human_move_and_click(page, btn)
-                human_sleep(2.0, 4.0)
-                log("🔐 تم محاولة تسجيل الدخول")
-                return True
-            except Exception as e:
-                log("⚠️ خطأ أثناء ملء نموذج الدخول:", e)
-    except Exception:
-        pass
-    return False
+def search_event_from_home(page, query="حديقة السويدي"):
+    """
+    يفتح الصفحة الرئيسية، يقبل الكوكيز، يبحث عن 'حديقة السويدي'،
+    ثم ينقر على نتيجة تحتوي 'حديقة' و/أو 'Suwaidi' ويدخل صفحة الحجز.
+    """
+    log("🏠 فتح الصفحة الرئيسية...")
+    page.goto("https://webook.com/", wait_until="domcontentloaded", timeout=TIMEOUT)
+    human_sleep(0.8, 1.6)
+    accept_cookies(page)
+    human_sleep(0.6, 1.2)
 
-def open_event_with_fallback(page, url):
-    # open event page with retries and try alt locales
-    log("🌐 فتح الحدث:", url)
-    try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT)
-        st = resp.status if resp else None
-        log(f"↪️ status={st} url={page.url}")
-    except Exception as e:
-        log("⚠️ goto error:", e)
-        st = None
+    # ابحث عن صندوق البحث (احتمالات متعددة)
+    search_candidates = [
+        "input[type='search']",
+        "input[placeholder*='بحث']",
+        "input[placeholder*='Search']",
+        "input[name='q']",
+        "input[aria-label*='بحث'], input[aria-label*='search']",
+    ]
+    search = None
+    for sel in search_candidates:
+        loc = page.locator(sel).first
+        if loc.count() and loc.is_visible():
+            search = loc
+            break
+    if not search:
+        # أحيانًا زر/أيقونة البحث يُظهر الحقل
+        try:
+            icon = page.locator("button:has(svg), button:has-text('بحث'), [role=button]:has-text('بحث')").first
+            if icon.count():
+                human_move_and_click(page, icon); human_sleep(0.4,0.9)
+                # جرّب مرة ثانية
+                for sel in search_candidates:
+                    loc = page.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        search = loc; break
+        except: pass
 
-    if st in (404, 500, 502, 503) or st is None:
-        # try without /ar/ then /en/
-        alt1 = url.replace("/ar/", "/")
-        alt2 = url.replace("/ar/", "/en/")
-        for alt in (alt1, alt2):
-            try:
-                log("🔁 تجربة بديلة:", alt)
-                resp = page.goto(alt, wait_until="domcontentloaded", timeout=TIMEOUT)
-                st = resp.status if resp else None
-                log(f"↪️ status={st} url={page.url}")
-                if st and st < 400:
-                    return True
-            except Exception as e:
-                log("⚠️ alt goto error:", e)
-    return (st is not None and st < 400)
+    if not search:
+        log("❌ لم أجد مربع البحث على الصفحة الرئيسية.")
+        return False
+
+    # اكتب النص واضغط Enter
+    search.click()
+    search.fill(query)
+    human_sleep(0.3, 0.8)
+    page.keyboard.press("Enter")
+    human_sleep(1.0, 2.0)
+
+    # انتظر نتائج البحث، ثم اختر النتيجة الصحيحة
+    # نحاول روابط/بطاقات فيها "حديقة" أو "Suwaidi" أو "suwaidi-park"
+    result_locators = [
+        page.get_by_role("link", name=re.compile(r"حديقة|Suwaidi", re.I)),
+        page.locator("a[href*='suwaidi-park']"),
+        page.locator("a:has-text('حديقة')"),
+    ]
+    target = None
+    for loc in result_locators:
+        if loc.count():
+            target = loc.first
+            break
+
+    if not target:
+        # جرب أي بطاقة/عنصر يحتوي نص البحث
+        try:
+            any_res = page.locator("a, [role=link], article, div.card").filter(
+                has_text=re.compile(r"حديقة|Suwaidi", re.I)
+            ).first
+            if any_res.count(): target = any_res
+        except: pass
+
+    if not target:
+        log("❌ لم أجد نتيجة مناسبة لحديقة السويدي.")
+        return False
+
+    human_move_and_click(page, target); human_sleep(0.8, 1.6)
+
+    # إذا لم نصل لصفحة /zones/.. /book، نحاول إيجاد زر/رابط "احجز الآن" أو ما شابه
+    if "/zones/" not in page.url:
+        try:
+            book_btn = page.get_by_role("link", name=re.compile(r"احجز|احجز الآن|Book|حجز", re.I)).first
+            if book_btn.count():
+                human_move_and_click(page, book_btn); human_sleep(0.8,1.4)
+        except: pass
+
+    # لو كان رابط المنطقة بدون /book، نجرّب إضافة /book
+    if "/zones/" in page.url and "/book" not in page.url:
+        try:
+            page.goto(page.url.rstrip("/") + "/book", wait_until="domcontentloaded", timeout=TIMEOUT)
+            human_sleep(0.8, 1.4)
+        except: pass
+
+    log(f"📍 وصلنا: {page.url}")
+    return ("/zones/" in page.url and "/book" in page.url)
 
 def find_booking_scope(page):
-    # If booking UI is inside iframe, return that frame; else return page
     frames = page.frames
     log(f"🔎 عدد الإطارات: {len(frames)}")
     for fr in frames:
@@ -209,172 +202,102 @@ def find_booking_scope(page):
         if any(k in u for k in ["webook", "booking", "calendar", "zone", "book", "suwaidi"]):
             log("✅ اخترت iframe:", fr.url)
             return fr
-    log("ℹ️ استخدام الصفحة الرئيسية كـ scope.")
+    log("ℹ️ استخدام الصفحة نفسها كـ scope.")
     return page
 
-def dump_buttons(scope, label="page"):
-    try:
-        btns = scope.locator("button, [role=button], a, [aria-label], [data-date]")
-        cnt = btns.count()
-        lines = []
-        for i in range(min(cnt, 2000)):
-            el = btns.nth(i)
-            try:
-                t = el.inner_text().strip()
-            except:
-                t = ""
-            try:
-                al = el.get_attribute("aria-label") or ""
-            except:
-                al = ""
-            try:
-                dd = el.get_attribute("data-date") or ""
-            except:
-                dd = ""
-            if t or al or dd:
-                lines.append(f"{i:04d} | txt='{t}' | aria-label='{al}' | data-date='{dd}'")
-        with open("artifacts/page_buttons.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        log("🧾 حفظت artifacts/page_buttons.txt (أبرز الأزرار)")
-    except Exception as e:
-        log("⚠️ لم أتمكن من حفظ page_buttons:", e)
-
-# ---------- الحجز ليوم واحد ----------
-def book_for_date(scope, target_date: date):
-    variants = date_variants(target_date)
-    log("🔎 محاولات نصوص اليوم:", variants)
-    # 1) حاول data-date
-    iso = target_date.strftime("%Y-%m-%d")
-    selectors = [f'[data-date="{iso}"]', f'button[data-date="{iso}"]']
-    for sel in selectors:
+def click_date(scope, d: date) -> bool:
+    variants = date_variants(d)
+    iso = d.strftime("%Y-%m-%d")
+    # data-date أولاً
+    for sel in [f'[data-date="{iso}"]', f'button[data-date="{iso}"]',
+                f'[aria-label*="{iso}"]', f'button[aria-label*="{iso}"]']:
         try:
             loc = scope.locator(sel).first
             if loc.count() and loc.is_enabled():
-                human_move_and_click(scope, loc)
-                human_sleep(0.8, 1.4)
-                log(f"✅ ضغطت التاريخ عبر {sel}")
+                human_move_and_click(scope, loc); human_sleep(0.6, 1.2)
+                log(f"✅ اخترت التاريخ via {sel}")
                 return True
-        except Exception:
-            pass
-
-    # 2) حاول aria-label/text/role
+        except: pass
+    # by role / by text
     for v in variants:
         try:
-            # by aria-label
-            loc = scope.locator(f'[aria-label*="{v}"]').first
-            if loc.count() and loc.is_enabled():
-                human_move_and_click(scope, loc); human_sleep(0.8,1.4)
-                log(f"✅ ضغطت التاريخ aria-label {v}"); return True
-        except Exception:
-            pass
-        try:
-            # by button role (text)
             loc = scope.get_by_role("button", name=re.compile(re.escape(v), re.I)).first
             if loc.count() and loc.is_enabled():
-                human_move_and_click(scope, loc); human_sleep(0.8,1.4)
-                log(f"✅ ضغطت التاريخ role/button {v}"); return True
-        except Exception:
-            pass
+                human_move_and_click(scope, loc); human_sleep(0.6,1.2)
+                log(f"✅ اخترت التاريخ: {v} (role)")
+                return True
+        except: pass
         try:
             loc = scope.get_by_text(re.compile(re.escape(v), re.I)).first
             if loc.count() and loc.is_enabled():
-                human_move_and_click(scope, loc); human_sleep(0.8,1.4)
-                log(f"✅ ضغطت التاريخ by text {v}"); return True
-        except Exception:
-            pass
-
-    log("⚠️ لم أتمكن من الضغط على التاريخ — حفظت الأزرار للتشخيص.")
-    dump_buttons(scope, "page")
+                human_move_and_click(scope, loc); human_sleep(0.6,1.2)
+                log(f"✅ اخترت التاريخ: {v} (text)")
+                return True
+        except: pass
+    log(f"⚠️ لم أجد اليوم {d.isoformat()}")
     return False
 
 def pick_time_and_tickets(scope):
-    # بعد الضغط على التاريخ عادة تظهر أوقات في الأسفل — نحاول اختيار أول وقت متاح
+    # اختر أي وقت متاح (زر فيه HH:MM)
     try:
-        # common selectors for time slots — نهج متعدد
-        slot_selectors = [
-            "div.times button", "div.time-slot button", "button.time", "button[class*='slot']",
-            "button:has-text('00:')", "button:has-text(':00')"
-        ]
-        for sel in slot_selectors:
-            try:
-                btn = scope.locator(sel).filter(has_text=re.compile(r"\d{1,2}:\d{2}", re.I)).first
-                if btn.count() and btn.is_enabled():
-                    human_move_and_click(scope, btn); human_sleep(0.6, 1.2)
-                    log("✅ ضغطت وقت عبر selector:", sel)
-                    break
-            except Exception:
-                pass
-        # بعد اختيار الوقت، قد يظهر عدد التذاكر مع أزرار زائد/ناقص
-        # حاول رفع العدد إلى 5
-        plus_selectors = [
-            "button[aria-label*='increase'], button[aria-label*='plus'], button:has-text('+')",
-            "button[class*='plus'], button[class*='increment']"
-        ]
-        target_tickets = 5
-        # بعض الواجهات تظهر قيمة في input[type=number] أو span
-        try:
-            # احاول إيجاد input قيمة التذاكر
-            num_input = scope.locator("input[type='number'], input[name*='qty'], input[id*='qty']").first
-            if num_input.count():
-                # اكتب القيمة مباشرة إذا ممكن
-                try:
-                    num_input.fill(str(target_tickets), timeout=2000)
-                    log(f"✅ ضبطت عدد التذاكر عبر input => {target_tickets}")
-                    human_sleep(0.4,0.8)
-                except:
-                    pass
-        except Exception:
-            pass
-        # إن لم ينجح، اضغط على زر + عدة مرات حتى 5
-        for sel in plus_selectors:
-            try:
-                btn = scope.locator(sel).first
-                if btn.count():
-                    for i in range(target_tickets):
-                        human_move_and_click(scope, btn); human_sleep(0.25, 0.6)
-                    log("✅ رفعت التذاكر عبر زر +")
-                    break
-            except Exception:
-                pass
+        btn = scope.locator("button, [role=button]").filter(
+            has_text=re.compile(r"\b\d{1,2}:\d{2}\b")
+        ).first
+        if btn.count() and btn.is_enabled():
+            human_move_and_click(scope, btn); human_sleep(0.6, 1.2)
+            log("⏰ اخترت وقتاً متاحاً")
+    except: pass
 
-        # بعد ذلك اضغط زر "إكمال الحجز" أو "Complete" أو "Confirm"
-        try:
-            finish = scope.get_by_role("button", name=re.compile(r"إكمال|إتمام|confirm|complete|حجز|حفظ|Checkout|Book", re.I)).first
-            if finish.count():
-                # قبل الضغط، تأكد وجود مربع الشروط إن وُجد ووافق عليه
-                try:
-                    chk = scope.locator("input[type='checkbox'], input[name*='terms'], input[id*='terms']").first
-                    if chk.count():
-                        try:
-                            if not chk.is_checked():
-                                human_move_and_click(scope, chk); human_sleep(0.2,0.6)
-                                log("✅ وافقت على الشروط")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                human_move_and_click(scope, finish); human_sleep(1.0, 2.0)
-                log("✅ ضغطت زر إكمال الحجز")
-                return True
-        except Exception:
-            pass
+    # اجعل التذاكر = 5 (إما عبر input أو زر +)
+    target = 5
+    try:
+        qty = scope.locator("input[type='number'], input[name*='qty'], input[id*='qty']").first
+        if qty.count():
+            qty.fill(str(target)); human_sleep(0.3,0.7)
+            log("🎟️ ضبطت التذاكر عبر input =", target)
+    except: pass
 
-    except Exception as e:
-        log("⚠️ خطأ أثناء اختيار الوقت/التذاكر:", e)
+    plus_candidates = [
+        "button[aria-label*='increase']", "button[aria-label*='plus']",
+        "button[class*='plus']", "button[class*='increment']",
+        "button:has-text('+')"
+    ]
+    for sel in plus_candidates:
+        try:
+            b = scope.locator(sel).first
+            if b.count():
+                # اضغط حتى 5 مرات احتياطًا
+                for _ in range(target):
+                    human_move_and_click(scope, b); human_sleep(0.25, 0.6)
+                log("🎟️ رفعت التذاكر عبر زر +")
+                break
+        except: pass
+
+    # وافق على الشروط إن وُجدت
+    try:
+        chk = scope.locator("input[type='checkbox'], input[name*='terms'], input[id*='terms']").first
+        if chk.count():
+            if not chk.is_checked():
+                human_move_and_click(scope, chk); human_sleep(0.2,0.6)
+                log("☑️ وافقت على الشروط")
+    except: pass
+
+    # إكمال الحجز
+    try:
+        finish = scope.get_by_role("button", name=re.compile(r"إكمال|إتمام|confirm|complete|حجز|Checkout|Book", re.I)).first
+        if finish.count():
+            human_move_and_click(scope, finish); human_sleep(1.0, 2.0)
+            log("✅ ضغطت زر إكمال الحجز")
+            return True
+    except: pass
     return False
 
-# ---------- Main flow ----------
+# ============== التشغيل الرئيسي ==============
 def run():
-    if not EVENT_URL:
-        log("❌ لم تُحدد EVENT_URL"); return
-
-    # parse dates
     sd = parse_iso(START_DATE) if START_DATE else date.today()
     ed = parse_iso(END_DATE) if END_DATE else sd
-    if ed < sd:
-        sd, ed = ed, sd
+    if ed < sd: sd, ed = ed, sd
 
-    os.makedirs("artifacts", exist_ok=True)
     os.makedirs("artifacts/videos", exist_ok=True)
 
     with sync_playwright() as p:
@@ -382,11 +305,9 @@ def run():
             "headless": True,
             "args": [
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
+                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             ],
-            "slow_mo": 30,  # يبطئ الأوامر قليلاً ليبدو طبيعي
+            "slow_mo": 30,
         }
         if PROXY_URL:
             launch_kwargs["proxy"] = {"server": PROXY_URL}
@@ -395,9 +316,8 @@ def run():
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent=choose_ua(),
-            viewport={"width": random.choice([1200,1280,1366,1440]), "height": random.choice([700,768,800,900])},
-            locale="ar-SA",
-            timezone_id="Asia/Riyadh",
+            viewport={"width": random.choice([1200,1280,1366,1440]), "height": random.choice([720,768,800,900])},
+            locale="ar-SA", timezone_id="Asia/Riyadh",
             record_video_dir="artifacts/videos",
             record_video_size={"width": 1366, "height": 768},
             extra_http_headers={
@@ -413,127 +333,75 @@ def run():
         page.on("response", lambda r: log(f"[HTTP] {r.status} {r.url}"))
 
         try:
-            # 1) افتح الصفحة الرئيسية لتوليد الجلسة
-            log("🏠 فتح الصفحة الرئيسية...")
-            try:
-                page.goto("https://webook.com/", wait_until="domcontentloaded", timeout=TIMEOUT)
-            except Exception as e:
-                log("⚠️ خطأ فتح الهوم:", e)
-            human_sleep(0.8, 1.6)
-            accept_cookies(page)
-            human_sleep(0.6, 1.2)
-
-            # 2) افتح رابط الفعالية مع fallback
-            ok = open_event_with_fallback(page, EVENT_URL)
+            ok = search_event_from_home(page, SEARCH_QUERY)
             if not ok:
-                log("❌ الفعالية لم تفتح بنجاح داخل البوت (404 أو خطأ). حفظت لقطة.")
+                log("❌ تعذر الوصول لصفحة الفعالية من البحث. حفظت لقطة.")
                 page.screenshot(path="artifacts/final.png", full_page=True)
                 return
 
-            human_sleep(0.8, 1.6)
-            # 3) تسجيل الدخول إن كان مطلوبًا
-            login_if_needed(page)
-            human_sleep(1.0, 2.0)
-
-            # 4) حدد النطاق scope (iframe أو الصفحة)
+            # التعامل مع iframe/الصفحة
             scope = find_booking_scope(page)
-            # save DOM/buttons for diagnosis if needed
-            try:
-                with open("artifacts/page.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                log("📝 حفظ page.html للـ diagnosis")
-            except Exception:
-                pass
-            try:
-                dump_buttons(scope, "page")
-            except Exception:
-                pass
+            accept_cookies(scope); human_sleep(0.5,1.0)
 
-            # 5) Loop over dates
+            # حلقة على الأيام
             cur = sd
             while cur <= ed:
-                log(f"=== محاولة الحجز لـ {cur.isoformat()} ===")
-                # refresh event page each loop (robustness)
-                try:
-                    page.goto(EVENT_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
-                    human_sleep(0.6, 1.2)
-                except Exception:
-                    pass
-
-                scope = find_booking_scope(page)
-                accept_cookies(scope)
-                human_sleep(0.5, 1.0)
-
-                if not book_for_date(scope, cur):
-                    log(f"⚠️ فشل الضغط على {cur.isoformat()}، سأنقل لليوم التالي.")
-                    # احفظ لقطة مفصلة
-                    try:
-                        scope.screenshot(path=f"artifacts/fail_{cur.strftime('%Y%m%d')}.png", full_page=True)
-                    except:
-                        pass
+                log(f"=== محاولة {cur.isoformat()} ===")
+                if not click_date(scope, cur):
+                    # لو فشلت، خذ لقطة ونروح لليوم التالي
+                    try: scope.screenshot(path=f"artifacts/fail_{cur.strftime('%Y%m%d')}.png", full_page=True)
+                    except: pass
                     cur += timedelta(days=1)
                     continue
 
-                human_sleep(0.6, 1.2)
-                # بعد الضغط على اليوم، ننتظر ونحاول اختيار الوقت والرفع للتذاكر
-                success_booking = pick_time_and_tickets(scope)
-                if success_booking:
-                    log(f"✅ حاولت الحجز لـ {cur.isoformat()} (تم الضغط على إكمال).")
-                    # optionally: wait for confirmation page or message
-                    human_sleep(1.5, 3.0)
+                human_sleep(0.6,1.2)
+                booked = pick_time_and_tickets(scope)
+                if booked:
+                    log(f"✅ تم الضغط على إكمال الحجز لليوم {cur.isoformat()}")
+                    human_sleep(1.0, 2.0)
                 else:
-                    log(f"⚠️ لم يكتمل الحجز تلقائياً لـ {cur.isoformat()}. حفظت لقطة للتشخيص.")
-                    try:
-                        scope.screenshot(path=f"artifacts/after_click_{cur.strftime('%Y%m%d')}.png", full_page=True)
-                    except:
-                        pass
+                    log(f"⚠️ لم يكتمل الحجز تلقائيًا لليوم {cur.isoformat()} — لقطة للتشخيص")
+                    try: scope.screenshot(path=f"artifacts/after_{cur.strftime('%Y%m%d')}.png", full_page=True)
+                    except: pass
 
-                # انتظر قليلاً ثم اذهب لليوم التالي
                 cur += timedelta(days=1)
-                human_sleep(1.0, 2.0)
+                human_sleep(0.8, 1.6)
 
-            # نهاية اللوب: لقطة نهائية
             try:
                 page.screenshot(path="artifacts/final.png", full_page=True)
                 log("📸 حفظت artifacts/final.png")
-            except Exception:
-                pass
+            except: pass
 
         finally:
-            # حفظ trace و الفيديو
             try:
                 context.tracing.stop(path="trace.zip")
                 log("🧭 Saved trace.zip")
             except Exception as e:
                 log("ℹ️ trace stop err:", e)
-            # حفظ الفيديو باسم ثابت (Playwright يولّد ملف داخل artifacts/videos)
+
+            # احفظ الفيديو باسم ثابت
             try:
                 video = page.video
             except Exception:
                 video = None
             try:
                 page.close()
-            except:
-                pass
+            except: pass
             try:
                 if video:
                     video.save_as("artifacts/videos/session.webm")
                     log("🎥 Saved video -> artifacts/videos/session.webm")
             except Exception as e:
                 log("⚠️ video save err:", e)
-            try:
-                context.close()
-            except:
-                pass
+
+            try: context.close()
+            except: pass
             browser.close()
 
 if __name__ == "__main__":
     try:
-        run()
-        sys.exit(0)
+        run(); sys.exit(0)
     except PWTimeout as e:
-        log("⛔ Timeout:", e)
-        sys.exit(1)
+        log(f"⛔ Timeout: {e}"); sys.exit(1)
     except Exception as e:
-        log("❌ خطأ:", e)
-        sys.exit(1)
+        log(f"❌ خطأ: {e}"); sys.exit(1)
