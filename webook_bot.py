@@ -1,172 +1,266 @@
-# -*- coding: utf-8 -*-
-import os, sys, time, re, traceback
+import os, time
 from datetime import datetime
+from typing import List
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
-PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
-START_URL = "https://webook.com/ar"
+# ========= إعدادات من المتغيرات =========
+BASE_URL    = os.getenv("BASE_URL", "https://webook.com/ar").strip()
 EVENT_QUERY = os.getenv("EVENT_QUERY", "حديقة السويدي").strip()
-TARGET_TIME = os.getenv("TARGET_TIME", "00:00 - 16:00").strip()
-TICKETS_COUNT = int(os.getenv("TICKETS_COUNT", "5"))
+START_DATE  = os.getenv("START_DATE", "").strip()
+END_DATE    = os.getenv("END_DATE", "").strip()
+TIME_TEXT   = os.getenv("TIME_TEXT", "16:00").strip()
+
+EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
+PASS  = os.getenv("WEBOOK_PASSWORD", "").strip()
 
 ART_DIR = "artifacts"
-VIDEO_DIR = os.path.join(ART_DIR, "video")
-os.makedirs(ART_DIR, exist_ok=True)
-os.makedirs(VIDEO_DIR, exist_ok=True)
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+# ========= أدوات صغيرة =========
+def log(msg: str):
+    print(msg, flush=True)
 
-def shot(page, label):
-    path = os.path.join(ART_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.png")
+def snooze(a=0.7, b=1.5):
+    t = a if b <= a else (a + (b-a) * 0.6)
+    time.sleep(t)
+
+def save_shot(page, name="shot"):
+    path = f"{ART_DIR}/{name}.png"
     try:
         page.screenshot(path=path, full_page=True)
-        log(f"📸 {label}: {path}")
+        log(f"📸 saved: {path}")
     except Exception as e:
-        log(f"⚠️ screenshot error {label}: {e}")
+        log(f"⚠️ screenshot error: {e}")
 
-def wait(page, ms=800):
+def wait_idle(page, ms=1200):
+    # انتظار بسيط بين الخطوات (تجنّب الحظر/التحميل الجزئي)
     page.wait_for_timeout(ms)
 
-def click_by_text(page, texts, timeout=7000):
-    for t in texts:
-        for sel in [f"button:has-text('{t}')", f"a:has-text('{t}')"]:
-            loc = page.locator(sel).first
-            try:
-                if loc.count():
-                    loc.click(timeout=timeout); return True
-            except: pass
+def click_first(page, selectors: List[str], timeout=4000) -> bool:
+    """يحاول العثور على أول محدد موجود والضغط عليه"""
+    for sel in selectors:
         try:
-            loc = page.get_by_text(t, exact=False).first
-            if loc.count():
-                loc.click(timeout=timeout); return True
-        except: pass
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click()
+                return True
+        except PWTimeout:
+            continue
+        except Exception:
+            continue
     return False
 
-def find_search(page):
-    sels = [
-        "input[placeholder*='بحث']",
-        "input[placeholder*='Search']",
-        "input[type='search']",
-        "input[name='search']",
+def click_text(page, texts: List[str], timeout=4000) -> bool:
+    """اضغط على أول زر/رابط نصّه من القائمة"""
+    for t in texts:
+        try:
+            loc = page.locator(f"button:has-text('{t}'), a:has-text('{t}')").first
+            if loc.count() > 0:
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click()
+                return True
+        except PWTimeout:
+            continue
+        except Exception:
+            continue
+    return False
+
+def fill_login_if_needed(page):
+    # إذا ظهرت صفحة تسجيل الدخول — عبّئ الحقول واضغط "تسجيل الدخول"
+    try:
+        email_f = page.locator("input[name*=email], input[type='email']").first
+        pass_f  = page.locator("input[name*=password], input[type='password']").first
+        if email_f.count() and pass_f.count():
+            log("🏷️ صفحة تسجيل الدخول مكتشفة")
+            email_f.fill(EMAIL)
+            pass_f.fill(PASS)
+            snooze(0.5, 1.0)
+            # أزرار محتملة
+            if not click_text(page, ["تسجيل الدخول","Login","Sign in","الدخول"], timeout=5000):
+                # زر عام داخل الفورم
+                click_first(page, ["form button[type=submit]","button[type=submit]"], timeout=5000)
+            wait_idle(page, 1500)
+            save_shot(page, "after_login")
+    except Exception as e:
+        log(f"⚠️ login skip: {e}")
+
+def reject_cookies(page):
+    # أزرار محتملة لرفض الكوكيز
+    cookie_texts = ["رفض", "أرفض", "رفض الكل", "رفض الكوكيز", "Reject", "Reject all"]
+    if click_text(page, cookie_texts, timeout=2500):
+        log("🍪 تم رفض الكوكيز")
+        wait_idle(page, 800)
+
+def handle_404_refresh(page, tries=5):
+    for i in range(tries):
+        if page.locator(":text('404')").first.count() == 0:
+            return True
+        log(f"↻ صفحة 404 — محاولة تحديث ({i+1}/{tries})")
+        page.reload()
+        page.wait_for_load_state("domcontentloaded")
+        wait_idle(page, 1200)
+    return False
+
+def search_event(page):
+    # ابحث عن الفعالية من الصفحة الرئيسية
+    log(f"🔎 البحث عن: {EVENT_QUERY}")
+    # بعض المواقع لديها أيقونة/حقل بحث مختلف
+    # نحاول فتح شريط البحث ثم نكتب ونضغط Enter
+    variants = [
+        "input[placeholder*='ابحث'], input[placeholder*='بحث'], input[type='search']",
+        "input[name='q']", "input[role='searchbox']"
     ]
-    for s in sels:
-        loc = page.locator(s).first
-        if loc.count(): return loc
-    # أحيانًا حقل البحث يفتح بزر
-    click_by_text(page, ["بحث","Search"], timeout=2000)
-    for s in sels:
-        loc = page.locator(s).first
-        if loc.count(): return loc
-    return None
+    opened = False
+    # أحياناً زر البحث يجب الضغط عليه لإظهار الحقل
+    click_text(page, ["بحث", "ابحث", "Search"], timeout=1500)
 
-def do_login(page):
-    # الذهاب لصفحة الدخول صراحة
-    page.goto(f"{START_URL}/login", wait_until="domcontentloaded", timeout=120_000)
-    wait(page, 800)
-    email = page.locator("input[type='email'], input[name*=email], input[placeholder*='البريد']").first
-    pwd   = page.locator("input[type='password'], input[name*=pass], input[placeholder*='كلمة']").first
-    email.wait_for(timeout=15000); pwd.wait_for(timeout=15000)
-    email.fill(EMAIL); pwd.fill(PASSWORD)
-    shot(page, "login_filled")
-    click_by_text(page, ["تسجيل الدخول","Login","Sign in","تسجيل الدّخول"], timeout=10000)
-    # انتظار انتقال/رجوع
-    for _ in range(20):
-        if page.locator("input[type='password']").count()==0 and "login" not in (page.url.lower()):
+    for sel in variants:
+        try:
+            inp = page.locator(sel).first
+            if inp.count():
+                inp.click()
+                inp.fill(EVENT_QUERY)
+                inp.press("Enter")
+                opened = True
+                break
+        except Exception:
+            continue
+
+    if not opened:
+        # محاولة أخيرة: Ctrl+K أو '/'
+        page.keyboard.press("/")
+        snooze(0.4, 0.6)
+        page.keyboard.type(EVENT_QUERY)
+        page.keyboard.press("Enter")
+
+    wait_idle(page, 1500)
+    save_shot(page, "after_search")
+
+    # افتح أول نتيجة مناسبة تحتوي نص الفعالية
+    try:
+        res = page.locator(f"a:has-text('{EVENT_QUERY}')").first
+        res.wait_for(state="visible", timeout=8000)
+        res.click()
+        wait_idle(page, 1200)
+        return True
+    except Exception:
+        # افتح أي بطاقة تقود للحجز
+        return click_text(page, ["احجز الآن", "احجز", "Book now", "Book tickets"], timeout=6000)
+
+def pick_date_and_time(page):
+    # اختر تاريخاً بين START_DATE و END_DATE إن توفرت
+    try:
+        if START_DATE:
+            target = datetime.fromisoformat(START_DATE).day
+            btn = page.locator(f"button:has-text('{target}')").first
+            if btn.count():
+                btn.click()
+                wait_idle(page, 800)
+        save_shot(page, "date_selected")
+    except Exception:
+        pass
+
+    # اختر الوقت — إن كان هناك شريط أوقات
+    try:
+        # حاول بالنص المحدد (مثل 16:00) ثم بدائل
+        time_texts = [TIME_TEXT, "16:00", "16", "00:00 - 16:00", "16:00 - 00:00"]
+        if click_text(page, time_texts, timeout=3000):
+            log("⏰ تم اختيار الوقت")
+        else:
+            # إن لم يوجد، اضغط أول خيار وقت ظاهر
+            any_time = page.locator("button:has-text('00:00'), button:has-text('16'), div:has-text('16:00')").first
+            if any_time.count():
+                any_time.click()
+        wait_idle(page, 900)
+        save_shot(page, "time_selected")
+    except Exception:
+        pass
+
+def add_tickets(page, qty=5):
+    # أزرار زيادة التذاكر (+)
+    plus_selectors = [
+        "button:has-text('+')",
+        "button[aria-label*='زيد'], button[aria-label*='زيادة'], button[aria-label*='increase']",
+        "button:has(svg[aria-label*='+'])",
+    ]
+    for _ in range(qty):
+        if click_first(page, plus_selectors, timeout=2500):
+            snooze(0.25, 0.5)
+        else:
             break
-        wait(page, 400)
-    shot(page, "after_login")
-    log("✅ تم تسجيل الدخول (ما لم يطلب 2FA).")
+    save_shot(page, "after_plus")
 
-def main():
-    if not EMAIL or not PASSWORD:
-        log("❌ يجب تمرير WEBOOK_EMAIL و WEBOOK_PASSWORD (من Run workflow).")
-        sys.exit(1)
+def press_continue(page):
+    # اضغط التالي/استمرار/متابعة/Continue
+    cont_texts = ["استمرار","التالي","متابعة","Continue","Next","أكمل الحجز"]
+    if click_text(page, cont_texts, timeout=7000):
+        log("➡️ تم الضغط على زر المتابعة")
+        wait_idle(page, 1200)
+        save_shot(page, "after_continue")
+    else:
+        log("⚠️ لم أجد زر المتابعة")
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        ctx = browser.new_context(viewport={"width":1366,"height":768}, record_video_dir=VIDEO_DIR)
+def run():
+    os.makedirs(ART_DIR, exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            record_video_dir=ART_DIR, record_video_size={"width": 1280, "height": 720}
+        )
         page = ctx.new_page()
 
         try:
-            # 1) فتح الرئيسية ورفض الكوكيز
-            log(f"🌐 فتح: {START_URL}")
-            page.goto(START_URL, wait_until="domcontentloaded", timeout=120000)
-            shot(page, "home")
-            if click_by_text(page, ["رفض","رفض الكل","Decline","Reject","لا أوافق"], timeout=3000):
-                log("🍪 رفض الكوكيز"); shot(page, "after_cookie")
+            log(f"🌐 فتح: {BASE_URL}")
+            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+            wait_idle(page, 1000)
 
-            # 2) تسجيل الدخول أولًا
-            log("🔐 تسجيل الدخول")
-            do_login(page)
+            # 404؟
+            if not handle_404_refresh(page, tries=3):
+                save_shot(page, "still_404")
+                raise RuntimeError("صفحة 404 مستمرة")
 
-            # 3) البحث عن الفعالية
-            log(f"🔎 البحث عن: {EVENT_QUERY}")
-            page.goto(START_URL, wait_until="domcontentloaded", timeout=120000)
-            sbox = find_search(page)
-            if not sbox: raise RuntimeError("لم أجد حقل البحث.")
-            sbox.click(); sbox.fill(EVENT_QUERY); page.keyboard.press("Enter")
-            wait(page, 1500); shot(page, "after_search")
+            reject_cookies(page)
+            save_shot(page, "home")
 
-            # 4) فتح بطاقة الفعالية
-            if not click_by_text(page, [EVENT_QUERY], timeout=12000):
-                # بديل: أول عنصر يحوي النص
-                card = page.get_by_text(EVENT_QUERY, exact=False).first
-                if card.count(): card.click(timeout=10000)
-                else: raise RuntimeError("تعذّر فتح بطاقة الفعالية.")
-            wait(page, 1200); shot(page, "event_opened")
+            # ابحث ثم افتح صفحة الفعالية
+            if not search_event(page):
+                raise RuntimeError("تعذر العثور على الفعالية من البحث")
+            wait_idle(page, 1200)
 
-            # 5) الذهاب لصفحة الحجز (إن وجد زر)
-            click_by_text(page, ["احجز الآن","احجز","Book tickets","Book now","احجز تذاكر"], timeout=8000)
-            wait(page, 800); shot(page, "maybe_tickets")
+            # إن ظهرت صفحة تسجيل الدخول هنا:
+            fill_login_if_needed(page)
 
-            # 6) اختيار الوقت
-            log(f"🕒 اختيار الوقت: {TARGET_TIME}")
-            if not click_by_text(page, [TARGET_TIME], timeout=10000):
-                try:
-                    slot = page.get_by_text(TARGET_TIME, exact=False).first
-                    if slot.count(): slot.click(timeout=8000)
-                except: pass
-            wait(page, 800); shot(page, "time_selected")
+            # بعض المواقع تعرض زر "Book" في صفحة الحدث
+            click_text(page, ["احجز الآن","احجز","Book now","Book tickets"], timeout=5000)
+            wait_idle(page, 1000)
 
-            # 7) الضغط على زر + مرات محددة
-            log(f"➕ الضغط على + × {TICKETS_COUNT}")
-            plus_sels = [
-                "button:has-text('+')",
-                "button[aria-label*='plus']",
-                "button[aria-label*='زيادة']",
-                "[role='button']:has-text('+')",
-            ]
-            added = 0
-            for i in range(TICKETS_COUNT):
-                clicked = False
-                for sel in plus_sels:
-                    loc = page.locator(sel).first
-                    try:
-                        if loc.count():
-                            loc.click(timeout=4000); added += 1; clicked = True; break
-                    except: pass
-                if not clicked: break
-                wait(page, 300)
-            shot(page, f"after_plus_{added}")
+            # اختيار التاريخ/الوقت
+            pick_date_and_time(page)
 
-            # 8) متابعة/التالي
-            if click_by_text(page, ["استمرار","التالي","Continue","Next","متابعة","أكمل الحجز"], timeout=8000):
-                log("✅ تابع الخطوة التالية"); wait(page, 800); shot(page, "after_continue")
-            else:
-                log("ℹ️ لم أجد زر المتابعة (قد يتطلب خطوة داخلية).")
+            # إضافة 5 تذاكر
+            add_tickets(page, qty=5)
 
-            shot(page, "final")
-            log("✅ تم التنفيذ — راجع مجلد artifacts")
+            # تابع
+            press_continue(page)
 
-        except PWTimeout as e:
-            log(f"⛔ Timeout: {e}"); shot(page, "timeout")
+            # لو أعادنا لصفحة دخول ثانية
+            fill_login_if_needed(page)
+
+            save_shot(page, "final")
+            log("✅ انتهى التشغيل")
+
         except Exception as e:
-            log(f"❌ Error: {e}"); traceback.print_exc(); shot(page, "exception")
+            log(f"❌ خطأ: {e}")
+            save_shot(page, "error")
         finally:
-            ctx.close(); browser.close()
-            log("🟢 انتهى التشغيل.")
+            try:
+                ctx.close()
+                browser.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
-    main()
+    run()
