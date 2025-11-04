@@ -1,4 +1,4 @@
-name: Run Webook Bot
+name: Run Webook Bot (LEGACY - stop before +)
 
 on:
   workflow_dispatch:
@@ -8,14 +8,12 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # عدّلها من شاشة "Run workflow" أو اتركها كما هي
       BASE_URL: "https://webook.com/ar"
       EVENT_QUERY: "حديقة السويدي"
-      START_DATE: "2025-11-03"   # YYYY-MM-DD (اختياري)
+      START_DATE: "2025-11-03"   # اختياري
       END_DATE:   "2025-11-06"   # اختياري
-      TIME_TEXT:  "16:00"        # نص الوقت المرغوب إن وُجد (اختياري)
+      TIME_TEXT:  "16:00"        # اختياري
 
-      # يجب إضافة هذين السرين من Settings > Secrets and variables > Actions
       WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
       WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
 
@@ -42,7 +40,7 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run bot
+      - name: Run bot (legacy)
         run: |
           set -x
           mkdir -p artifacts
