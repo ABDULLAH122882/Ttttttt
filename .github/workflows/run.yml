@@ -2,35 +2,22 @@ name: Run Webook Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      email:
-        description: "WEBOOK email"
-        required: true
-        type: string
-      password:
-        description: "WEBOOK password"
-        required: true
-        type: string
-      event_query:
-        description: "اسم البحث عن الفعالية"
-        required: false
-        type: string
-        default: "حديقة السويدي"
-      target_time:
-        description: "نص الوقت كما يظهر (مثال: 00:00 - 16:00)"
-        required: false
-        type: string
-        default: "00:00 - 16:00"
-      tickets:
-        description: "عدد الضغطات على زر +"
-        required: false
-        type: number
-        default: 5
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    env:
+      # عدّلها من شاشة "Run workflow" أو اتركها كما هي
+      BASE_URL: "https://webook.com/ar"
+      EVENT_QUERY: "حديقة السويدي"
+      START_DATE: "2025-11-03"   # YYYY-MM-DD (اختياري)
+      END_DATE:   "2025-11-06"   # اختياري
+      TIME_TEXT:  "16:00"        # نص الوقت المرغوب إن وُجد (اختياري)
+
+      # يجب إضافة هذين السرين من Settings > Secrets and variables > Actions
+      WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
+      WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
 
     steps:
       - name: Checkout repo
@@ -39,38 +26,31 @@ jobs:
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: System deps for Chromium
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xvfb libnss3 libxss1 libasound2 libatk1.0-0 \
+            xvfb libnss3 libxss1 libatk1.0-0 \
             libatk-bridge2.0-0 libcups2 libxkbcommon0 \
-            libxshmfence1 libgbm1 libxtst6 fonts-liberation
+            libxshmfence1 libgbm1 libxtst6 libgtk-3-0 fonts-liberation
 
       - name: Install Python deps + Chromium
         run: |
-          python -m pip install -U pip wheel setuptools
-          python -m pip install playwright
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
       - name: Run bot
-        env:
-          WEBOOK_EMAIL: ${{ inputs.email }}
-          WEBOOK_PASSWORD: ${{ inputs.password }}
-          EVENT_QUERY: ${{ inputs.event_query }}
-          TARGET_TIME: ${{ inputs.target_time }}
-          TICKETS_COUNT: ${{ inputs.tickets }}
         run: |
           set -x
           mkdir -p artifacts
           xvfb-run -a python webook_bot.py | tee artifacts/bot.log
 
       - name: Upload artifacts (screens, video, logs)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-artifacts
-          path: artifacts/**
-          retention-days: 7
+          path: artifacts/
+          if-no-files-found: warn
