@@ -1,49 +1,76 @@
 name: Run Webook Bot
 
 on:
-  workflow_dispatch: {}   # تشغيل يدوي فقط
+  workflow_dispatch:
+    inputs:
+      email:
+        description: "WEBOOK email"
+        required: true
+        type: string
+      password:
+        description: "WEBOOK password"
+        required: true
+        type: string
+      event_query:
+        description: "اسم البحث عن الفعالية"
+        required: false
+        type: string
+        default: "حديقة السويدي"
+      target_time:
+        description: "نص الوقت كما يظهر (مثال: 00:00 - 16:00)"
+        required: false
+        type: string
+        default: "00:00 - 16:00"
+      tickets:
+        description: "عدد الضغطات على زر +"
+        required: false
+        type: number
+        default: 5
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: تنزيل الملفات
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: إعداد Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: تثبيت التبعيات اللازمة للنظام
+      - name: System deps for Chromium
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 \
-              libcups2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
-              libasound2t64 libxshmfence1 libgbm1 fonts-liberation
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libxss1 libasound2 libatk1.0-0 \
+            libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+            libxshmfence1 libgbm1 libxtst6 fonts-liberation
 
-      - name: تثبيت مكتبات Python
+      - name: Install Python deps + Chromium
         run: |
-          pip install --upgrade pip
-          pip install playwright
+          python -m pip install -U pip wheel setuptools
+          python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: تشغيل البوت (يدويًا)
+      - name: Run bot
         env:
-          WEBOOK_EMAIL: ${{ secrets.WEBOOK_EMAIL }}
-          WEBOOK_PASSWORD: ${{ secrets.WEBOOK_PASSWORD }}
-          START_DATE: "2025-11-03"
-          END_DATE: "2025-11-06"
-          TIME_RANGE: "00:00 - 16:00"
-          EVENT_URL: "https://webook.com/ar/..."   # ضع هنا رابط الحدث الصحيح
+          WEBOOK_EMAIL: ${{ inputs.email }}
+          WEBOOK_PASSWORD: ${{ inputs.password }}
+          EVENT_QUERY: ${{ inputs.event_query }}
+          TARGET_TIME: ${{ inputs.target_time }}
+          TICKETS_COUNT: ${{ inputs.tickets }}
         run: |
           set -x
           mkdir -p artifacts
           xvfb-run -a python webook_bot.py | tee artifacts/bot.log
 
-      - name: رفع اللقطات والملفات التشخيصية
+      - name: Upload artifacts (screens, video, logs)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-artifacts
-          path: artifacts/
+          path: artifacts/**
+          retention-days: 7
