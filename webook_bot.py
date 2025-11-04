@@ -1,90 +1,172 @@
 # -*- coding: utf-8 -*-
-import os, re, sys, time, random, urllib.parse
-from typing import List
+import os, sys, time, re, traceback
+from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-HEADLESS = os.getenv("HEADLESS", "1") != "0"
-TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "120000"))
-EMAIL = os.getenv("WEBOOK_EMAIL", "")
-PASSWORD = os.getenv("WEBOOK_PASSWORD", "")
-BASE_HOME = "https://webook.com/ar"
+EMAIL = os.getenv("WEBOOK_EMAIL", "").strip()
+PASSWORD = os.getenv("WEBOOK_PASSWORD", "").strip()
+START_URL = "https://webook.com/ar"
+EVENT_QUERY = os.getenv("EVENT_QUERY", "حديقة السويدي").strip()
+TARGET_TIME = os.getenv("TARGET_TIME", "00:00 - 16:00").strip()
+TICKETS_COUNT = int(os.getenv("TICKETS_COUNT", "5"))
+
 ART_DIR = "artifacts"
-VIDEO_DIR = f"{ART_DIR}/videos"
+VIDEO_DIR = os.path.join(ART_DIR, "video")
 os.makedirs(ART_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-def log(m): print(m, flush=True)
-def snooze(a=0.4, b=1.2): time.sleep(random.uniform(a, b))
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def wait_idle(page): 
-    try: page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-    except: pass
-
-def handle_cookies(page):
+def shot(page, label):
+    path = os.path.join(ART_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.png")
     try:
-        btns = page.locator("button:has-text('رفض'), button:has-text('قبول'), button:has-text('Accept'), button:has-text('Reject')")
-        if btns.count():
-            btns.first.click()
-            log("✅ تعامل مع الكوكيز")
-            snooze()
-    except: pass
-
-def ensure_login(page):
-    if page.locator("input[type='email']").count():
-        page.fill("input[type='email']", EMAIL)
-        page.fill("input[type='password']", PASSWORD)
-        log("✅ أدخل البريد وكلمة المرور")
-        snooze(1,2)
-        page.click("button:has-text('تسجيل الدخول'), button:has-text('Log in')")
-        wait_idle(page)
-        snooze(2,3)
-
-def bump_tickets(page, count=5):
-    log("🎟️ محاولة الضغط على زر + خمس مرات")
-    plus_selectors = [
-        "button:has(svg)", "button[aria-label*='plus']",
-        "button:has-text('+')", "[role=button]:has-text('+')",
-        "button:has-text('زيادة')", "div:has-text('+')", "span:has-text('+')"
-    ]
-    for sel in plus_selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.count():
-                for i in range(count):
-                    btn.click()
-                    log(f"➕ ضغطة رقم {i+1}")
-                    snooze(0.6, 1.0)
-                return True
-        except: pass
-
-    # محاولة احتياطية بالنقر حول الرقم 0
-    try:
-        zero = page.locator("text='0'").first
-        box = zero.locator("xpath=..").first
-        btns = box.locator("button, div, span")
-        for i in range(min(5, btns.count())):
-            btns.nth(i).click()
-            log(f"🔁 ضغطة احتياطية {i+1}")
-            snooze(0.6, 1.0)
-        return True
+        page.screenshot(path=path, full_page=True)
+        log(f"📸 {label}: {path}")
     except Exception as e:
-        log(f"⚠️ لم يتم العثور على زر + : {e}")
-        return False
+        log(f"⚠️ screenshot error {label}: {e}")
 
-def run():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(record_video_dir=VIDEO_DIR)
-        page = context.new_page()
-        page.goto(f"{BASE_HOME}/zones/suwaidi-park-rs25/book")
-        wait_idle(page)
-        handle_cookies(page)
-        ensure_login(page)
-        bump_tickets(page, 5)
-        page.screenshot(path=f"{ART_DIR}/final.png", full_page=True)
-        log("📸 تم حفظ لقطة الشاشة النهائية")
-        context.close()
-        browser.close()
+def wait(page, ms=800):
+    page.wait_for_timeout(ms)
+
+def click_by_text(page, texts, timeout=7000):
+    for t in texts:
+        for sel in [f"button:has-text('{t}')", f"a:has-text('{t}')"]:
+            loc = page.locator(sel).first
+            try:
+                if loc.count():
+                    loc.click(timeout=timeout); return True
+            except: pass
+        try:
+            loc = page.get_by_text(t, exact=False).first
+            if loc.count():
+                loc.click(timeout=timeout); return True
+        except: pass
+    return False
+
+def find_search(page):
+    sels = [
+        "input[placeholder*='بحث']",
+        "input[placeholder*='Search']",
+        "input[type='search']",
+        "input[name='search']",
+    ]
+    for s in sels:
+        loc = page.locator(s).first
+        if loc.count(): return loc
+    # أحيانًا حقل البحث يفتح بزر
+    click_by_text(page, ["بحث","Search"], timeout=2000)
+    for s in sels:
+        loc = page.locator(s).first
+        if loc.count(): return loc
+    return None
+
+def do_login(page):
+    # الذهاب لصفحة الدخول صراحة
+    page.goto(f"{START_URL}/login", wait_until="domcontentloaded", timeout=120_000)
+    wait(page, 800)
+    email = page.locator("input[type='email'], input[name*=email], input[placeholder*='البريد']").first
+    pwd   = page.locator("input[type='password'], input[name*=pass], input[placeholder*='كلمة']").first
+    email.wait_for(timeout=15000); pwd.wait_for(timeout=15000)
+    email.fill(EMAIL); pwd.fill(PASSWORD)
+    shot(page, "login_filled")
+    click_by_text(page, ["تسجيل الدخول","Login","Sign in","تسجيل الدّخول"], timeout=10000)
+    # انتظار انتقال/رجوع
+    for _ in range(20):
+        if page.locator("input[type='password']").count()==0 and "login" not in (page.url.lower()):
+            break
+        wait(page, 400)
+    shot(page, "after_login")
+    log("✅ تم تسجيل الدخول (ما لم يطلب 2FA).")
+
+def main():
+    if not EMAIL or not PASSWORD:
+        log("❌ يجب تمرير WEBOOK_EMAIL و WEBOOK_PASSWORD (من Run workflow).")
+        sys.exit(1)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        ctx = browser.new_context(viewport={"width":1366,"height":768}, record_video_dir=VIDEO_DIR)
+        page = ctx.new_page()
+
+        try:
+            # 1) فتح الرئيسية ورفض الكوكيز
+            log(f"🌐 فتح: {START_URL}")
+            page.goto(START_URL, wait_until="domcontentloaded", timeout=120000)
+            shot(page, "home")
+            if click_by_text(page, ["رفض","رفض الكل","Decline","Reject","لا أوافق"], timeout=3000):
+                log("🍪 رفض الكوكيز"); shot(page, "after_cookie")
+
+            # 2) تسجيل الدخول أولًا
+            log("🔐 تسجيل الدخول")
+            do_login(page)
+
+            # 3) البحث عن الفعالية
+            log(f"🔎 البحث عن: {EVENT_QUERY}")
+            page.goto(START_URL, wait_until="domcontentloaded", timeout=120000)
+            sbox = find_search(page)
+            if not sbox: raise RuntimeError("لم أجد حقل البحث.")
+            sbox.click(); sbox.fill(EVENT_QUERY); page.keyboard.press("Enter")
+            wait(page, 1500); shot(page, "after_search")
+
+            # 4) فتح بطاقة الفعالية
+            if not click_by_text(page, [EVENT_QUERY], timeout=12000):
+                # بديل: أول عنصر يحوي النص
+                card = page.get_by_text(EVENT_QUERY, exact=False).first
+                if card.count(): card.click(timeout=10000)
+                else: raise RuntimeError("تعذّر فتح بطاقة الفعالية.")
+            wait(page, 1200); shot(page, "event_opened")
+
+            # 5) الذهاب لصفحة الحجز (إن وجد زر)
+            click_by_text(page, ["احجز الآن","احجز","Book tickets","Book now","احجز تذاكر"], timeout=8000)
+            wait(page, 800); shot(page, "maybe_tickets")
+
+            # 6) اختيار الوقت
+            log(f"🕒 اختيار الوقت: {TARGET_TIME}")
+            if not click_by_text(page, [TARGET_TIME], timeout=10000):
+                try:
+                    slot = page.get_by_text(TARGET_TIME, exact=False).first
+                    if slot.count(): slot.click(timeout=8000)
+                except: pass
+            wait(page, 800); shot(page, "time_selected")
+
+            # 7) الضغط على زر + مرات محددة
+            log(f"➕ الضغط على + × {TICKETS_COUNT}")
+            plus_sels = [
+                "button:has-text('+')",
+                "button[aria-label*='plus']",
+                "button[aria-label*='زيادة']",
+                "[role='button']:has-text('+')",
+            ]
+            added = 0
+            for i in range(TICKETS_COUNT):
+                clicked = False
+                for sel in plus_sels:
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count():
+                            loc.click(timeout=4000); added += 1; clicked = True; break
+                    except: pass
+                if not clicked: break
+                wait(page, 300)
+            shot(page, f"after_plus_{added}")
+
+            # 8) متابعة/التالي
+            if click_by_text(page, ["استمرار","التالي","Continue","Next","متابعة","أكمل الحجز"], timeout=8000):
+                log("✅ تابع الخطوة التالية"); wait(page, 800); shot(page, "after_continue")
+            else:
+                log("ℹ️ لم أجد زر المتابعة (قد يتطلب خطوة داخلية).")
+
+            shot(page, "final")
+            log("✅ تم التنفيذ — راجع مجلد artifacts")
+
+        except PWTimeout as e:
+            log(f"⛔ Timeout: {e}"); shot(page, "timeout")
+        except Exception as e:
+            log(f"❌ Error: {e}"); traceback.print_exc(); shot(page, "exception")
+        finally:
+            ctx.close(); browser.close()
+            log("🟢 انتهى التشغيل.")
 
 if __name__ == "__main__":
-    run()
+    main()
